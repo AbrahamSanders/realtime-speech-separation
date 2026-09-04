@@ -263,13 +263,20 @@ class LMDatasetBuilder:
                 start_code = 0
                 example_index = 0
                 while True:
+                    # slice codes from the full sequence for the current example
                     end_code = min(start_code + context_codes, len(codes_str))
                     example = codes_str[start_code:end_code]
+
+                    # select the target voice for the current example
+                    start_code_target = int(start_code / num_channels)
+                    end_code_target = int(end_code / num_channels)
                     target_voice = self._select_target_voice(
                         target_channel_speech_ranges,
-                        int(start_code / num_channels),
-                        int(end_code / num_channels),
+                        start_code_target,
+                        end_code_target,
                     )
+
+                    # yield the example and metadata
                     if target_voice is not None:
                         tv_start_code, tv_end_code, tv_str = target_voice
                         example = f"{self.header_target_voice_token}{tv_str}{self.header_end_token}{example}"
@@ -285,7 +292,12 @@ class LMDatasetBuilder:
                         yield example, metadata
                         example_index += 1
                     else:
-                        print(f"Could not find target voice sample outside of range {start_code}-{end_code} on channel {target_channel} in file {file_root}. Skipping example...")
+                        print(
+                            f"Could not find target voice sample outside of range {start_code_target}-{end_code_target} "
+                            f"on channel {target_channel} in file {file_root}. Skipping example..."
+                        )
+
+                    # move to next start_code, or break if we've reached the end of the sequence
                     if end_code >= len(codes_str):
                         break
                     start_code = end_code - overlap_codes
