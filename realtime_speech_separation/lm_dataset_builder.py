@@ -162,21 +162,21 @@ class LMDatasetBuilder:
         example_end_code: int,
         target_min_candidates: int = 20,
         target_min_length_secs: float = 3.0,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[int, int, str]]:
         # only sample from speech segments outside the current example range.
         target_channel_speech_ranges = [
             (start_code, end_code, length_secs, voice_str) for start_code, end_code, length_secs, voice_str in target_channel_speech_ranges 
             if (end_code <= example_start_code or start_code >= example_end_code) # outside the current example range
         ]
         # take target_min_candidates longest candidates or all that are target_min_length_secs and longer, whichever yields more candidates.
-        voice_candidate_strs = [
-            voice_str for i, (_, _, length_secs, voice_str) in enumerate(target_channel_speech_ranges) 
+        voice_candidates = [
+            (start_code, end_code, voice_str) for i, (start_code, end_code, length_secs, voice_str) in enumerate(target_channel_speech_ranges) 
             if i < target_min_candidates or length_secs >= target_min_length_secs
         ]
-        # Select a random voice candidate from voice_candidate_strs
-        if not voice_candidate_strs:
+        # Select a random voice candidate from voice_candidates
+        if not voice_candidates:
             return None
-        selected_voice = random.choice(voice_candidate_strs)
+        selected_voice = random.choice(voice_candidates)
         return selected_voice
 
     def iterate_examples(
@@ -250,11 +250,6 @@ class LMDatasetBuilder:
             # build the examples
             random.seed(self.voice_enrollment_selection_seed)
             for target_channel, codes_str in enumerate(codes_strs):
-                metadata = {
-                    "file_id": file_root,
-                    "target_channel": target_channel,
-                    "example_index": 0,
-                }
                 # load the speech ranges for the target channel for use in selecting target voices for each example
                 target_channel_vad_file = os.path.join(vads_path, f"{file_root}_c{target_channel}.json")
                 target_channel_vad = self._load_vad(target_channel_vad_file)
@@ -266,8 +261,9 @@ class LMDatasetBuilder:
 
                 # yield examples from the sequence with the specified sequence length and overlap
                 start_code = 0
+                example_index = 0
                 while True:
-                    end_code = start_code + context_codes
+                    end_code = min(start_code + context_codes, len(codes_str))
                     example = codes_str[start_code:end_code]
                     target_voice = self._select_target_voice(
                         target_channel_speech_ranges,
@@ -275,11 +271,21 @@ class LMDatasetBuilder:
                         int(end_code / num_channels),
                     )
                     if target_voice is not None:
-                        example = f"{self.header_target_voice_token}{target_voice}{self.header_end_token}{example}"
+                        tv_start_code, tv_end_code, tv_str = target_voice
+                        example = f"{self.header_target_voice_token}{tv_str}{self.header_end_token}{example}"
+                        metadata = {
+                            "file_id": file_root,
+                            "target_channel": target_channel,
+                            "example_index": example_index,
+                            "ex_start_secs": start_code / (self.codec_framerate * self.num_codebooks * num_channels),
+                            "ex_end_secs": end_code / (self.codec_framerate * self.num_codebooks * num_channels),
+                            "tv_start_secs": tv_start_code / (self.codec_framerate * self.num_codebooks),
+                            "tv_end_secs": tv_end_code / (self.codec_framerate * self.num_codebooks),
+                        }
+                        yield example, metadata
+                        example_index += 1
                     else:
-                        example = f"{self.header_end_token}{example}"
-                    yield example, metadata.copy()
-                    metadata["example_index"] += 1
+                        print(f"Could not find target voice sample outside of range {start_code}-{end_code} on channel {target_channel} in file {file_root}. Skipping example...")
                     if end_code >= len(codes_str):
                         break
                     start_code = end_code - overlap_codes

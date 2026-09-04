@@ -1,8 +1,9 @@
 import json
 import os
+import librosa
 from collections import OrderedDict
 from glob import glob
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import streamlit as st
@@ -12,6 +13,8 @@ from realtime_speech_separation.utils.audio_utils import smooth_join, create_cro
 
 DEFAULT_OUTPUT_DIR = "output"
 METADATA_SUFFIX = "_metadata.jsonl"
+DEFAULT_RAW_AUDIO_DIR = "data/audio/raw"
+RAW_AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".opus"]
 
 @st.cache_resource()
 def get_audio_tokenizers() -> Tuple[AudioTokenizer, AudioTokenizer]:
@@ -21,37 +24,39 @@ def get_audio_tokenizers() -> Tuple[AudioTokenizer, AudioTokenizer]:
 
 
 @st.cache_resource(show_spinner=False)
-def load_metadata(metadata_path: str, _mtime: float) -> Tuple[OrderedDict, int]:
-    """Load the metadata jsonl into a nested index.
+def load_metadata(metadata_path: str) -> Tuple[OrderedDict, List[Dict[str, Any]]]:
+    """Load the metadata jsonl.
 
-    Returns (index, num_lines) where index maps:
-        file_id -> target_channel -> [line indices into the dataset txt file]
+    Returns (index, records) where records holds each line's metadata exactly as it
+    appears in the file, and index maps:
+        file_id -> target_channel -> [line indices into records / the dataset txt file]
     Each line of the metadata jsonl corresponds 1:1 to the same line of the txt file.
     """
     index: OrderedDict[str, OrderedDict[int, List[int]]] = OrderedDict()
-    num_lines = 0
+    records: List[Dict[str, Any]] = []
     with open(metadata_path, "r", encoding="utf-8") as f:
-        for line_idx, line in enumerate(f):
+        for line in f:
             line = line.strip()
             if not line:
                 continue
             meta = json.loads(line)
             channels = index.setdefault(meta["file_id"], OrderedDict())
-            channels.setdefault(meta["target_channel"], []).append(line_idx)
-            num_lines = line_idx + 1
-    return index, num_lines
+            channels.setdefault(meta["target_channel"], []).append(len(records))
+            records.append(meta)
+    return index, records
 
 
 @st.cache_resource(show_spinner=False)
-def load_line_offsets(txt_path: str, _mtime: float) -> np.ndarray:
+def load_line_offsets(txt_path: str) -> np.ndarray:
     """Byte offset of the start of each line in the dataset txt file.
 
-    The dataset files can be tens of GB, so the offsets are computed once by
-    streaming the file and then cached to a sidecar .npy next to it.
+    Lets any line be read without scanning the file, which can be tens of GB. The
+    offsets are computed once by streaming the file, then saved next to it as
+    <dataset>.txt.line_offsets.npy so later runs can just load them back.
     """
-    sidecar_path = f"{txt_path}.lineidx.npy"
-    if os.path.exists(sidecar_path) and os.path.getmtime(sidecar_path) >= os.path.getmtime(txt_path):
-        return np.load(sidecar_path)
+    line_offsets_path = f"{txt_path}.line_offsets.npy"
+    if os.path.exists(line_offsets_path):
+        return np.load(line_offsets_path)
 
     offsets = [0]
     chunk_size = 1 << 24
@@ -75,7 +80,7 @@ def load_line_offsets(txt_path: str, _mtime: float) -> np.ndarray:
 
     offsets = np.array(offsets, dtype=np.int64)
     try:
-        np.save(sidecar_path, offsets)
+        np.save(line_offsets_path, offsets)
     except OSError:
         pass  # a read-only dataset dir just means we recompute on the next cold start
     return offsets
@@ -105,11 +110,41 @@ def render_audio(
         audio = smooth_join(audio, output_audio.reshape(audio_tokenizer.num_channels, -1), *crossfade_ramps)
     return audio
 
+def try_load_original_audio(metadata: Dict, raw_audio_dir: str, length_secs: float) -> Optional[np.ndarray]:
+    m = metadata
+    for ext in RAW_AUDIO_EXTENSIONS:
+        audio_path = os.path.join(raw_audio_dir, f"{m['file_id']}{ext}")
+        if not os.path.exists(audio_path):
+            continue
+
+        # target voice audio
+        tv_length_secs = m["tv_end_secs"] - m["tv_start_secs"]
+        tv_length_secs = min(length_secs, tv_length_secs) if length_secs > 0 else tv_length_secs
+        tv_audio, tv_sr = librosa.load(audio_path, sr=None, mono=False, offset=m["tv_start_secs"], duration=tv_length_secs)
+        tv_audio = tv_audio[m["target_channel"]]
+
+        # example audio
+        ex_length_secs = m["ex_end_secs"] - m["ex_start_secs"]
+        ex_length_secs = min(length_secs, ex_length_secs) if length_secs > 0 else ex_length_secs
+        ex_audio_mono, ex_sr_mono = librosa.load(audio_path, sr=None, mono=True, offset=m["ex_start_secs"], duration=ex_length_secs)
+        ex_audio_stereo, ex_sr_stereo = librosa.load(audio_path, sr=None, mono=False, offset=m["ex_start_secs"], duration=ex_length_secs)
+        # make sure target channel is in position 0 in ex_audio_stereo
+        if m["target_channel"] != 0:
+            ex_audio_stereo = ex_audio_stereo[::-1]
+
+        sr = tv_sr
+        if sr != ex_sr_mono or sr != ex_sr_stereo:
+            raise ValueError("Sample rates of target voice and example audio do not match.")
+        
+        return tv_audio, ex_audio_mono, ex_audio_stereo, sr
+    return None
+
 def render_example(
     example: str, 
     chunk_size_secs: float,
     length_secs: float,
-    metadata: Dict
+    metadata: Dict,
+    raw_audio_dir: str,
 ) -> None:
     """Decode and render the media for a single dataset example.
     """
@@ -134,6 +169,8 @@ def render_example(
     )
     mono_tokenizer, stereo_tokenizer = get_audio_tokenizers()
     crossfade_ramps = create_crossfade_ramps(mono_tokenizer.sampling_rate, fade_secs=0.02)
+
+    st.write("Decoded Audio (target voice / mono / stereo):")
 
     # render the target voice audio
     target_voice_audio = render_audio(
@@ -167,6 +204,30 @@ def render_example(
     )
     st.audio(stereo_audio, sample_rate=stereo_tokenizer.sampling_rate)
 
+    st.write("Original Audio (target voice / mono / stereo):")
+
+    orig_audio = try_load_original_audio(metadata, raw_audio_dir, length_secs)
+    if orig_audio is None:
+        st.info("Original audio not found.")
+    else:
+        tv_audio, ex_audio_mono, ex_audio_stereo, sr = orig_audio
+        st.audio(tv_audio, sample_rate=sr)
+        st.audio(ex_audio_mono, sample_rate=sr)
+        st.audio(ex_audio_stereo, sample_rate=sr)
+
+def format_time_spans(metadata: Dict[str, Any]) -> str:
+    """One-line summary of the time spans in the metadata, for whichever are present."""
+    spans = [
+        ("example", "ex_start_secs", "ex_end_secs"),
+        ("target voice", "tv_start_secs", "tv_end_secs"),
+    ]
+    parts = []
+    for label, start_key, end_key in spans:
+        start, end = metadata.get(start_key), metadata.get(end_key)
+        if start is None or end is None:
+            continue
+        parts.append(f"**{label}** {start:.2f}\u2013{end:.2f} s ({end - start:.2f} s)")
+    return " \u00b7 ".join(parts)
 
 
 def find_metadata_files(output_dir: str) -> List[str]:
@@ -177,7 +238,6 @@ def set_position(file_i: int, channel_i: int, example_i: int) -> None:
     st.session_state.file_i = file_i
     st.session_state.channel_i = channel_i
     st.session_state.example_i = example_i
-
 
 def main() -> None:
     st.set_page_config(page_title="Dataset Explorer", layout="wide")
@@ -195,6 +255,7 @@ def main() -> None:
             metadata_files,
             format_func=os.path.basename,
         )
+        raw_audio_dir = st.text_input("Raw audio directory", DEFAULT_RAW_AUDIO_DIR)
 
     txt_path = metadata_path[: -len(METADATA_SUFFIX)] + ".txt"
     if not os.path.exists(txt_path):
@@ -202,14 +263,14 @@ def main() -> None:
         st.stop()
 
     with st.spinner("Loading metadata..."):
-        index, num_metadata_lines = load_metadata(metadata_path, os.path.getmtime(metadata_path))
+        index, records = load_metadata(metadata_path)
     with st.spinner("Indexing dataset lines (first load on a large file can take a while)..."):
-        offsets = load_line_offsets(txt_path, os.path.getmtime(txt_path))
+        offsets = load_line_offsets(txt_path)
 
-    if len(offsets) != num_metadata_lines:
+    if len(offsets) != len(records):
         st.warning(
             f"`{os.path.basename(txt_path)}` has {len(offsets):,} lines but the metadata has "
-            f"{num_metadata_lines:,}. They may be out of sync."
+            f"{len(records):,}. They may be out of sync."
         )
 
     file_ids = list(index.keys())
@@ -309,7 +370,7 @@ def main() -> None:
         )
 
         st.header("Decoding Settings")
-        chunk_size_secs = st.slider("Chunk size (seconds)", min_value=0.02, max_value=1.0, value=0.1, step=0.02)
+        chunk_size_secs = st.slider("Chunk size (seconds)", min_value=0.02, max_value=1.0, value=1.0, step=0.02)
         length_secs = st.slider("Length (seconds): zero for full length", min_value=0, max_value=300, value=0, step=1)
 
     # current example
@@ -323,13 +384,22 @@ def main() -> None:
     info_cols[2].metric("Example", f"{example_i} ({example_i + 1} / {len(example_lines)})")
     info_cols[3].metric("Dataset line", f"{line_idx:,}")
 
+    metadata = records[line_idx]
+    time_spans = format_time_spans(metadata)
+    if time_spans:
+        st.caption(time_spans)
+
     example = read_example(txt_path, offsets, line_idx)
     render_example(
         example,
         chunk_size_secs=chunk_size_secs,
         length_secs=length_secs,
-        metadata={"file_id": file_id, "target_channel": target_channel, "example_index": example_i},
-    )
+        metadata=metadata,
+        raw_audio_dir=raw_audio_dir,
+    )            
+
+    with st.expander("Raw metadata"):
+        st.json(metadata)
 
 
 if __name__ == "__main__":
