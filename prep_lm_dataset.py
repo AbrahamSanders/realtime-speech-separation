@@ -4,7 +4,7 @@ import functools
 import jsonlines
 from tqdm import tqdm
 
-from realtime_speech_separation.lm_dataset_builder import LMDatasetBuilder
+from realtime_speech_separation.lm_dataset_builder import LMDatasetBuilder, DELAY_TOKENS
 from codec_bpe import UNICODE_OFFSET_LARGE
 from codec_bpe.core.utils import get_codec_info, update_args_from_codec_info
 
@@ -17,15 +17,21 @@ if __name__ == "__main__":
     parser.add_argument("--num_codebooks", type=int, default=None)
     parser.add_argument("--codebook_size", type=int, default=None)
     parser.add_argument("--codec_framerate", type=float, default=None)
+    parser.add_argument("--header_delay_tokens", type=str, nargs="+", default=DELAY_TOKENS)
     parser.add_argument("--header_target_voice_token", type=str, default="<|target_voice|>")
     parser.add_argument("--header_end_token", type=str, default="<|end_header|>")
+    parser.add_argument("--skip_char", type=str, default="-")
     # handle hex values for unicode_offset with argparse: https://stackoverflow.com/a/25513044
     parser.add_argument("--unicode_offset", type=functools.partial(int, base=0), default=UNICODE_OFFSET_LARGE)
-    parser.add_argument("--context_secs", type=float, default=40.0)
-    parser.add_argument("--overlap_secs", type=float, default=10.0)
-    parser.add_argument("--max_voice_enrollment_secs", type=float, default=10.0)
+    parser.add_argument("--context_secs", type=float, default=60.0)
+    parser.add_argument("--overlap_secs", type=float, default=45.0)
+    parser.add_argument("--voice_enrollment_max_secs", type=float, default=10.0)
+    parser.add_argument("--voice_enrollment_ideal_min_secs", type=float, default=3.0)
+    parser.add_argument("--voice_enrollment_hard_min_secs", type=float, default=2.0)
     parser.add_argument("--voice_enrollment_vad_merge_secs", type=float, default=1.0)
-    parser.add_argument("--voice_enrollment_selection_seed", type=int, default=42)
+    parser.add_argument("--voice_enrollment_ideal_min_candidates", type=int, default=10)
+    parser.add_argument("--voice_enrollment_selection_seed", type=int, default=42 ** 2)
+    parser.add_argument("--delay_selection_seed", type=int, default=42 ** 3)
     parser.add_argument("--save_path", type=str, default="output/lm_dataset.txt")
     parser.add_argument("--codes_filter", type=str, nargs="+")
     parser.add_argument("--codes_filter_exclude", type=str, nargs="+")
@@ -46,14 +52,20 @@ if __name__ == "__main__":
         num_codebooks=args.num_codebooks,
         codebook_size=args.codebook_size,
         codec_framerate=args.codec_framerate,
+        header_delay_tokens=args.header_delay_tokens,
         header_target_voice_token=args.header_target_voice_token,
         header_end_token=args.header_end_token,
+        skip_char=args.skip_char,
         unicode_offset=args.unicode_offset,
         context_secs=args.context_secs,
         overlap_secs=args.overlap_secs,
-        max_voice_enrollment_secs=args.max_voice_enrollment_secs,
+        voice_enrollment_max_secs=args.voice_enrollment_max_secs,
+        voice_enrollment_ideal_min_secs=args.voice_enrollment_ideal_min_secs,
+        voice_enrollment_hard_min_secs=args.voice_enrollment_hard_min_secs,
         voice_enrollment_vad_merge_secs=args.voice_enrollment_vad_merge_secs,
+        voice_enrollment_ideal_min_candidates=args.voice_enrollment_ideal_min_candidates,
         voice_enrollment_selection_seed=args.voice_enrollment_selection_seed,
+        delay_selection_seed=args.delay_selection_seed,
     )
 
     save_dir = os.path.dirname(args.save_path)

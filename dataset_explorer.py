@@ -99,6 +99,7 @@ def render_audio(
     decoding_chunk_size_secs: float,
     length_secs: float
 ):
+    audio_tokenizer.reset_context()
     # stream-decode the reconstruction
     chunk_size_frames = int(decoding_chunk_size_secs * audio_tokenizer.framerate * audio_tokenizer.num_channels)
     decode_frames = min(int(length_secs * audio_tokenizer.framerate * audio_tokenizer.num_channels), len(audio_str)) if length_secs > 0 else len(audio_str)
@@ -167,10 +168,22 @@ def render_example(
         f"target voice: {len(target_voice):,} chars · "
         f"body: {len(body):,} chars"
     )
+
+    # render all example audio strs (target voice, mono, stereo)
+    mono_str = body[0::3]
+    stereo_str = "".join(a + b for a, b in zip(body[1::3], body[2::3]))
+    # if there is a delay in the example, the mono_str will be padded at the end with D future codes and the stereo_str will
+    # be padded at the beginning with 2D that number of skip chars (D per channel).
+    # In order to properly render the audio, we need to remove the delay padding from all channels.
+    delay_codes = (stereo_str.rfind("-") + 1) // 2
+    if delay_codes > 0:
+        mono_str = mono_str[:-delay_codes]
+        stereo_str = stereo_str[2 * delay_codes:]
+
     mono_tokenizer, stereo_tokenizer = get_audio_tokenizers()
     crossfade_ramps = create_crossfade_ramps(mono_tokenizer.sampling_rate, fade_secs=0.02)
 
-    st.write("Decoded Audio (target voice / mono / stereo):")
+    decoded_audio_header = st.empty()
 
     # render the target voice audio
     target_voice_audio = render_audio(
@@ -183,7 +196,6 @@ def render_example(
     st.audio(target_voice_audio, sample_rate=mono_tokenizer.sampling_rate)
 
     # render the mono channel
-    mono_str = body[0::3]
     mono_audio = render_audio(
         audio_str=mono_str,
         audio_tokenizer=mono_tokenizer,
@@ -194,7 +206,6 @@ def render_example(
     st.audio(mono_audio, sample_rate=mono_tokenizer.sampling_rate)
 
     # render the stereo channel
-    stereo_str = "".join(a + b for a, b in zip(body[1::3], body[2::3]))
     stereo_audio = render_audio(
         audio_str=stereo_str,
         audio_tokenizer=stereo_tokenizer,
@@ -204,16 +215,28 @@ def render_example(
     )
     st.audio(stereo_audio, sample_rate=stereo_tokenizer.sampling_rate)
 
-    st.write("Original Audio (target voice / mono / stereo):")
+    target_secs = target_voice_audio.shape[-1] / mono_tokenizer.sampling_rate
+    mono_secs = mono_audio.shape[-1] / mono_tokenizer.sampling_rate
+    stereo_secs = stereo_audio.shape[-1] / stereo_tokenizer.sampling_rate
+    decoded_audio_header.write(f"Decoded Audio: target voice ({target_secs:.2f} s) / mono ({mono_secs:.2f} s) / stereo ({stereo_secs:.2f} s):")
+
+    # load all original audios corresponding to this example for comparison (target voice, mono, stereo)
+    original_audio_header = st.empty()
 
     orig_audio = try_load_original_audio(metadata, raw_audio_dir, length_secs)
     if orig_audio is None:
         st.info("Original audio not found.")
+        original_audio_header.write("Original Audio (target voice / mono / stereo):")
     else:
         tv_audio, ex_audio_mono, ex_audio_stereo, sr = orig_audio
         st.audio(tv_audio, sample_rate=sr)
         st.audio(ex_audio_mono, sample_rate=sr)
         st.audio(ex_audio_stereo, sample_rate=sr)
+
+        target_secs = tv_audio.shape[-1] / sr
+        mono_secs = ex_audio_mono.shape[-1] / sr
+        stereo_secs = ex_audio_stereo.shape[-1] / sr
+        original_audio_header.write(f"Original Audio: target voice ({target_secs:.2f} s) / mono ({mono_secs:.2f} s) / stereo ({stereo_secs:.2f} s):")
 
 def format_time_spans(metadata: Dict[str, Any]) -> str:
     """One-line summary of the time spans in the metadata, for whichever are present."""
@@ -227,6 +250,8 @@ def format_time_spans(metadata: Dict[str, Any]) -> str:
         if start is None or end is None:
             continue
         parts.append(f"**{label}** {start:.2f}\u2013{end:.2f} s ({end - start:.2f} s)")
+
+    parts.append(f"**delay** {metadata.get('delay_secs', 0):.2f} s")
     return " \u00b7 ".join(parts)
 
 
