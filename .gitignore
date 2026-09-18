@@ -212,3 +212,5 @@ __marimo__/
 data
 MagiCodec
 output/
+
+*.out
