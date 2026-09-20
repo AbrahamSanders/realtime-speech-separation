@@ -400,8 +400,8 @@ def main():
         )
 
     if not model_args.cache_dataset_only:
+        dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
         if model_args.model_name_or_path:
-            dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
             model = model_cls.from_pretrained(
                 model_args.model_name_or_path,
                 from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -414,9 +414,9 @@ def main():
             )
         else:
             if model_cls is AutoModelForCausalLM:
-                model = model_cls.from_config(config, trust_remote_code=model_args.trust_remote_code)
+                model = model_cls.from_config(config, dtype=dtype, trust_remote_code=model_args.trust_remote_code)
             else:
-                model = model_cls._from_config(config)
+                model = model_cls._from_config(config, dtype=dtype)
             n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
             logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
 
