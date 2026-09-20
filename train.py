@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 
 import datasets
 import evaluate
+import numpy as np
 import torch
 from datasets import load_dataset
 
@@ -427,10 +428,11 @@ def main():
                 dtype=dtype,
             )
         else:
+            model_kwargs = {} if dtype in ["auto", None] else {"dtype": dtype}
             if model_cls is AutoModelForCausalLM:
-                model = model_cls.from_config(config, dtype=dtype, trust_remote_code=model_args.trust_remote_code)
+                model = model_cls.from_config(config, trust_remote_code=model_args.trust_remote_code, **model_kwargs)
             else:
-                model = model_cls._from_config(config, dtype=dtype)
+                model = model_cls._from_config(config, **model_kwargs)
             n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
             logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
 
@@ -499,10 +501,25 @@ def main():
             preds, labels = eval_preds
             # preds have the same shape as the labels, after the argmax(-1) has been calculated
             # by preprocess_logits_for_metrics but we need to shift the labels
-            labels = labels[:, 1:].reshape(-1)
-            preds = preds[:, :-1].reshape(-1)
+            labels = labels[:, 1:]
+            preds = preds[:, :-1]
             include = labels != -100
-            return metric.compute(predictions=preds[include], references=labels[include])
+            # The unmasked tokens of each sequence alternate between the target channel and the other channel
+            # (T O T O ...), so the rank of an unmasked token within its own sequence tells us which one it is.
+            unmasked_rank = np.cumsum(include, axis=-1) - 1
+            include_target = include & (unmasked_rank % 2 == 0)
+            include_other = include & (unmasked_rank % 2 == 1)
+
+            def accuracy(mask):
+                if not mask.any():
+                    return float("nan")
+                return metric.compute(predictions=preds[mask], references=labels[mask])["accuracy"]
+
+            return {
+                "target_accuracy": accuracy(include_target),
+                "other_accuracy": accuracy(include_other),
+                "accuracy": accuracy(include),
+            }
 
     if model_args.cache_dataset_only:
         logger.info("Caching dataset only, exiting now.")
