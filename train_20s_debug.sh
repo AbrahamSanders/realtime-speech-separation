@@ -1,0 +1,22 @@
+accelerate launch train.py \
+    --config_name=Qwen/Qwen3-1.7B-Base \
+    --tokenizer_name=output/magicodec_no_bpe_1cb_131k \
+    --train_file=output/dataset_magicodec_131k_20s_DEBUG.txt \
+    --per_device_train_batch_size=4 \
+    --gradient_accumulation_steps=4 \
+    --do_train \
+    --dtype=float32 \
+    --bf16 \
+    --output_dir=model-debug-20s \
+    --seed=42 \
+    --data_seed=42 \
+    --logging_steps=10 \
+    --report_to tensorboard \
+    --save_strategy=steps \
+    --save_steps=0.25 \
+    --lr_scheduler_type=cosine \
+    --num_train_epochs=1 \
+    --learning_rate=5e-05 \
+    --warmup_steps=0.03 \
+    --dataloader_drop_last \
+    --codec_embed_file=codec_embed_MagiCodec-50Hz-Base.pt
