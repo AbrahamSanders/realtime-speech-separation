@@ -1,6 +1,7 @@
 import json
 import os
 import librosa
+import torch
 from collections import OrderedDict
 from glob import glob
 from typing import Any, Dict, List, Tuple, Optional
@@ -18,8 +19,9 @@ RAW_AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".opus"]
 
 @st.cache_resource()
 def get_audio_tokenizers() -> Tuple[AudioTokenizer, AudioTokenizer]:
-    mono_tokenizer = AudioTokenizer()
-    stereo_tokenizer = AudioTokenizer(codec_model=mono_tokenizer.codec_model, num_channels=2)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    mono_tokenizer = AudioTokenizer(device=device)
+    stereo_tokenizer = AudioTokenizer(codec_model=mono_tokenizer.codec_model, num_channels=2, device=device)
     return mono_tokenizer, stereo_tokenizer
 
 

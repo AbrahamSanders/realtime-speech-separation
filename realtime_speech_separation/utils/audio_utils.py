@@ -22,4 +22,18 @@ def create_crossfade_ramps(sr: int, fade_secs: float) -> Tuple[int, np.ndarray, 
     fade_out = fade_in[::-1]
     return L, fade_in, fade_out
 
-    
+def pad_or_trim(chunk: np.ndarray, target_length: int, pad_side: str = "right") -> np.ndarray:
+    if chunk.ndim > 2:
+        raise ValueError("Input chunk must be a 1D or 2D array.")
+    if chunk.shape[-1] < target_length:
+        # Pad with zeros at the end
+        pad_width = target_length-chunk.shape[-1]
+        pad_width = (0, pad_width) if pad_side == "right" else (pad_width, 0)
+        if chunk.ndim == 2:
+            pad_width = ((0, 0), pad_width)
+        return np.pad(chunk, pad_width, mode="constant")
+    elif chunk.shape[-1] > target_length:
+        # Trim to target length
+        return chunk[..., :target_length]
+    else:
+        return chunk
