@@ -1,0 +1,31 @@
+# read in the checkpoint directory from the first command line argument
+CHECKPOINT_DIR=$1
+TEST_MODEL_DIR="${CHECKPOINT_DIR}-test"
+
+# if test model directory exists, remove it
+if [ -d $TEST_MODEL_DIR ]; then
+  rm -rf $TEST_MODEL_DIR
+fi
+
+# create it again
+mkdir $TEST_MODEL_DIR
+
+# copy the files from the checkpoint directory
+cp $CHECKPOINT_DIR/*.json $TEST_MODEL_DIR
+cp $CHECKPOINT_DIR/*.safetensors $TEST_MODEL_DIR
+
+# run the persist script
+python persist_codec_embeddings.py \
+    --model_path $TEST_MODEL_DIR \
+    --codec_embed_file codec_embed_MagiCodec-50Hz-Base.pt \
+    --save_vanilla
+
+# delete the original folder and rename the vanilla folder
+rm -rf $TEST_MODEL_DIR
+mv "${TEST_MODEL_DIR}-vanilla" $TEST_MODEL_DIR
+
+# convert to gguf format
+python ../llama.cpp/convert_hf_to_gguf.py $TEST_MODEL_DIR --outtype f32 --override-vocab
+llama quantize "${TEST_MODEL_DIR}/${TEST_MODEL_DIR}-F32.gguf" "${TEST_MODEL_DIR}/${TEST_MODEL_DIR}-F16.gguf" F16
+llama quantize "${TEST_MODEL_DIR}/${TEST_MODEL_DIR}-F32.gguf" "${TEST_MODEL_DIR}/${TEST_MODEL_DIR}-Q8_0.gguf" Q8_0
+llama quantize "${TEST_MODEL_DIR}/${TEST_MODEL_DIR}-F32.gguf" "${TEST_MODEL_DIR}/${TEST_MODEL_DIR}-Q4_K_M.gguf" Q4_K_M

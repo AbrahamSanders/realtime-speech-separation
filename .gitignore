@@ -213,6 +213,7 @@ data
 model-debug*
 MagiCodec
 output/
+Qwen3*
 
 *.out
 *.pt
