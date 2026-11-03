@@ -1,5 +1,9 @@
-from typing import Tuple
+from typing import Tuple, Union
+import librosa
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 def smooth_join(chunk1: np.ndarray, chunk2: np.ndarray, L: int, fade_in: np.ndarray, fade_out: np.ndarray) -> np.ndarray:
     if chunk1.shape[-1] == 0:
@@ -37,3 +41,42 @@ def pad_or_trim(chunk: np.ndarray, target_length: int, pad_side: str = "right") 
         return chunk[..., :target_length]
     else:
         return chunk
+
+def to_resampled_mono(
+    input_audio: Tuple[int, np.ndarray], 
+    target_sr: int, 
+    return_tuple: bool = False,
+) -> Union[Tuple[int, np.ndarray], np.ndarray]:
+    sr, input_audio = input_audio
+    if input_audio.dtype == np.int16:
+        input_audio = input_audio.astype("float32") / 32768.0
+    if input_audio.ndim == 2:
+        if input_audio.shape[1] == 2 and input_audio.shape[0] > 2:
+            input_audio = input_audio.T
+        input_audio = librosa.to_mono(input_audio) if input_audio.shape[0] > 1 else input_audio[0]
+    if sr != target_sr:
+        input_audio = librosa.resample(input_audio, orig_sr=sr, target_sr=target_sr)
+    if return_tuple:
+        return target_sr, input_audio
+    return input_audio
+
+def preprocess_enrollment_audio(
+    enrollment_audio: Tuple[int, np.ndarray], 
+    target_sr: int, 
+    min_length_secs: float = 2.0,
+    max_length_secs: float = 10.0,
+    return_tuple: bool = False,
+) -> Union[Tuple[int, np.ndarray], np.ndarray]:
+    if enrollment_audio is None:
+        return None
+    sr, enroll_audio = to_resampled_mono(enrollment_audio, target_sr, return_tuple=True)
+    if enroll_audio.shape[-1] > int(max_length_secs * sr):
+        enroll_audio = enroll_audio[:int(max_length_secs * sr)]
+        logger.info(f"Trimmed enrollment audio to {max_length_secs} seconds.")
+    elif enroll_audio.shape[-1] < int(min_length_secs * sr):
+        pad_length = int(min_length_secs * sr) - enroll_audio.shape[-1]
+        enroll_audio = np.concatenate([enroll_audio, np.zeros(pad_length, dtype=enroll_audio.dtype)])
+        logger.info(f"Padded enrollment audio to {min_length_secs} seconds.")
+    if return_tuple:
+        return sr, enroll_audio
+    return enroll_audio

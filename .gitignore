@@ -217,3 +217,5 @@ Qwen3*
 
 *.out
 *.pt
+*.wav
+*.mp3

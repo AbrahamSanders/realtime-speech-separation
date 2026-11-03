@@ -1,8 +1,11 @@
 import numpy as np
+import logging
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from .realtime_separator_config import RealtimeSeparatorConfig
+
+logger = logging.getLogger(__name__)
 
 class RealtimeSeparatorProfiler:
     def __init__(self, config: RealtimeSeparatorConfig):
@@ -61,6 +64,20 @@ class RealtimeSeparatorProfilerCollection:
         self.audio_tokenize_profiler.reset()
         self.audio_detokenize_profiler.reset()
         self.lm_profiler.reset()
+
+    def log(self, tag: Optional[str] = None):
+        if not tag:
+            tag = "Default"
+        if not self.config.run_profilers:
+            logger.info(f"Profiling disabled, no metrics to report ({tag}).")
+            return
+        logger.info(f"Realtime Factor Report ({tag}):")
+        logger.info(f"Total: {np.median(self.total_profiler.realtime_factor_values):.1f}x")
+        logger.info(f"Tokenize: {np.median(self.tokenize_profiler.realtime_factor_values):.1f}x")
+        logger.info(f"Detokenize: {np.median(self.detokenize_profiler.realtime_factor_values):.1f}x")
+        logger.info(f"Audio Tokenize: {np.median(self.audio_tokenize_profiler.realtime_factor_values):.1f}x")
+        logger.info(f"Audio Detokenize: {np.median(self.audio_detokenize_profiler.realtime_factor_values):.1f}x")
+        logger.info(f"LM: {np.median(self.lm_profiler.realtime_factor_values):.1f}x")
 
     def build_plot(self, ylim: Tuple[float, float] = (0.5, 4.0)):
         import matplotlib.pyplot as plt
