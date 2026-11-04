@@ -1,21 +1,20 @@
 import json
 import os
-import librosa
 import torch
 from collections import OrderedDict
 from glob import glob
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import streamlit as st
 
 from realtime_speech_separation.audio_tokenizer import AudioTokenizer
 from realtime_speech_separation.utils.audio_utils import smooth_join, create_crossfade_ramps
+from realtime_speech_separation.utils.data_utils import try_load_original_audio
 
 DEFAULT_OUTPUT_DIR = "output"
 METADATA_SUFFIX = "_metadata.jsonl"
 DEFAULT_RAW_AUDIO_DIR = "data/audio/raw"
-RAW_AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".opus"]
 
 @st.cache_resource()
 def get_audio_tokenizers() -> Tuple[AudioTokenizer, AudioTokenizer]:
@@ -112,35 +111,6 @@ def render_audio(
         (_, output_audio), _, _ = audio_tokenizer.detokenize_audio(chunk, preroll_samples=crossfade_ramps[0])
         audio = smooth_join(audio, output_audio.reshape(audio_tokenizer.num_channels, -1), *crossfade_ramps)
     return audio
-
-def try_load_original_audio(metadata: Dict, raw_audio_dir: str, length_secs: float) -> Optional[np.ndarray]:
-    m = metadata
-    for ext in RAW_AUDIO_EXTENSIONS:
-        audio_path = os.path.join(raw_audio_dir, f"{m['file_id']}{ext}")
-        if not os.path.exists(audio_path):
-            continue
-
-        # target voice audio
-        tv_length_secs = m["tv_end_secs"] - m["tv_start_secs"]
-        tv_length_secs = min(length_secs, tv_length_secs) if length_secs > 0 else tv_length_secs
-        tv_audio, tv_sr = librosa.load(audio_path, sr=None, mono=False, offset=m["tv_start_secs"], duration=tv_length_secs)
-        tv_audio = tv_audio[m["target_channel"]]
-
-        # example audio
-        ex_length_secs = m["ex_end_secs"] - m["ex_start_secs"]
-        ex_length_secs = min(length_secs, ex_length_secs) if length_secs > 0 else ex_length_secs
-        ex_audio_mono, ex_sr_mono = librosa.load(audio_path, sr=None, mono=True, offset=m["ex_start_secs"], duration=ex_length_secs)
-        ex_audio_stereo, ex_sr_stereo = librosa.load(audio_path, sr=None, mono=False, offset=m["ex_start_secs"], duration=ex_length_secs)
-        # make sure target channel is in position 0 in ex_audio_stereo
-        if m["target_channel"] != 0:
-            ex_audio_stereo = ex_audio_stereo[::-1]
-
-        sr = tv_sr
-        if sr != ex_sr_mono or sr != ex_sr_stereo:
-            raise ValueError("Sample rates of target voice and example audio do not match.")
-        
-        return tv_audio, ex_audio_mono, ex_audio_stereo, sr
-    return None
 
 def render_example(
     example: str, 

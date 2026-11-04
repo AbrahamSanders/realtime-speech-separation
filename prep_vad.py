@@ -7,7 +7,8 @@ from datetime import datetime
 from tqdm import tqdm
 from silero_vad import load_silero_vad, get_speech_timestamps
 
-SUPPORTED_EXTENSIONS = [".mp3", ".wav", ".flac", ".opus"]
+from realtime_speech_separation.utils.data_utils import RAW_AUDIO_EXTENSIONS
+
 SAMPLE_RATE = 16000
 
 class VADResult:
@@ -86,7 +87,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--audio_path", type=str, default="data/audio/raw", help="Directory containing the audio files")
     parser.add_argument("--vad_path", type=str, default="data/vad", help="Directory to save the VAD results")
-    parser.add_argument("--extensions", nargs="+", default=SUPPORTED_EXTENSIONS,
+    parser.add_argument("--extensions", nargs="+", default=RAW_AUDIO_EXTENSIONS,
         help="Audio file extensions to convert. Formats must be supported by a librosa backend.",
     )
     parser.add_argument("--audio_filter", nargs="+", 

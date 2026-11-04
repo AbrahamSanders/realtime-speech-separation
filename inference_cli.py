@@ -1,37 +1,38 @@
-from typing import Tuple, List
+from typing import Tuple, Optional
 import numpy as np
 import argparse
 import logging
 import librosa
 import os
-import soundfile as sf
 from tqdm import tqdm, trange
 
 from realtime_speech_separation import RealtimeSeparator, RealtimeSeparatorResources, RealtimeSeparatorConfig, add_common_inference_args
-from realtime_speech_separation.utils.audio_utils import pad_or_trim, preprocess_enrollment_audio
+from realtime_speech_separation.utils.audio_utils import pad_or_trim, preprocess_enrollment_audio, save_audio
 from realtime_speech_separation.realtime_separator_config import SUPPORTED_DELAY_SECS
+from realtime_speech_separation.utils.data_utils import get_audio_files
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = [".mp3", ".wav", ".flac", ".opus"]
+def get_enrollment_file(input_file: str) -> str:
+    file_name, ext = os.path.splitext(input_file)
+    return f"{file_name}_enrollment{ext}"
 
-def get_audio_files(args: argparse.Namespace) -> List[Tuple[str, str]]:
-    audio_files = []
-    if args.input_file:
-        audio_files.append((args.input_file, args.enrollment_file))
-    elif args.input_dir:
-        for file_name in os.listdir(args.input_dir):
-            file_name, ext = os.path.splitext(file_name)
-            if ext.lower() not in SUPPORTED_EXTENSIONS:
-                continue
-            if file_name.lower().endswith("_enrollment"):
-                continue
-            if file_name.lower().endswith("_separated"):
-                continue
-            input_file = os.path.join(args.input_dir, f"{file_name}{ext}")
-            enrollment_file = os.path.join(args.input_dir, f"{file_name}_enrollment{ext}")
-            audio_files.append((input_file, enrollment_file))
-    return audio_files
+def get_output_file(input_file: str, output_format: str, delay_secs: float, seed: Optional[int]) -> str:
+    file_name, _ = os.path.splitext(input_file)
+    return f"{file_name}_separated_delay_{delay_secs}_seed_{seed}.{output_format}"
+
+def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    input_audio, _ = librosa.load(input_file, sr=sr, mono=True, dtype=np.float32)
+    enrollment_file = get_enrollment_file(input_file)
+    if not os.path.exists(enrollment_file):
+        enrollment_audio = None
+        logger.warning(
+            f"Enrollment audio {enrollment_file} not found. A 10 second silent enrollment will be used. "
+            "This may cause unexpected separation results."
+        )
+    else:
+        enrollment_audio, _ = librosa.load(enrollment_file, sr=sr, mono=True, dtype=np.float32)
+    return input_audio, enrollment_audio
 
 def main(args: argparse.Namespace):
     separator = RealtimeSeparator(
@@ -55,26 +56,32 @@ def main(args: argparse.Namespace):
         ),
     )
 
-    audio_files = get_audio_files(args)
     sr = separator.resources.mono_audio_tokenizer.sampling_rate
-    for input_file, enrollment_file in tqdm(audio_files, desc="Processing audio files"):
-        logger.info(f"Processing input audio: {input_file}")
-        # Check if enrollment audio exists and load/preprocess it if available
-        if enrollment_file is None or not os.path.exists(enrollment_file):
-            separator.config.target_voice_enrollment = None
-            logger.warning(
-                f"Enrollment audio not provided for input audio {input_file}. A 10 second silent enrollment will be used. "
-                "This may cause unexpected separation results."
-            )
-        else:
-            enrollment_audio, _ = librosa.load(enrollment_file, sr=sr, mono=True, dtype=np.float32)
-            separator.config.target_voice_enrollment = preprocess_enrollment_audio((sr, enrollment_audio), sr, return_tuple=True)
+    input_files = get_audio_files(
+        args.input_dir, 
+        filter_include=args.input_filter, 
+        filter_exclude=["_enrollment.", "_separated_", "_reference."],
+    )
 
-        # Reset separator context & apply the new enrollment
+    for input_file in tqdm(input_files, desc="Processing input files"):
+        output_file = get_output_file(input_file, args.output_format, args.delay_secs, args.seed)
+        if os.path.exists(output_file) and not args.overwrite:
+            logger.info(f"Output file {output_file} already exists. Skipping.")
+            continue
+
+        logger.info(f"Processing input audio: {input_file}")
+
+        # Load the input audio and corresponding enrollment audio
+        input_audio, enrollment_audio = load_audio_file(input_file, sr)
+        
+        # Apply the new enrollment & Reset separator context
+        if enrollment_audio is not None:
+            separator.config.target_voice_enrollment = preprocess_enrollment_audio((sr, enrollment_audio), sr, return_tuple=True)
+        else:
+            separator.config.target_voice_enrollment = None
         separator.reset()
 
-        # Load the input audio & prepare it for separation
-        input_audio, _ = librosa.load(input_file, sr=sr, mono=True, dtype=np.float32)
+        # Prepare input audio for separation
         input_audio_length = input_audio.shape[-1]
         # If there is a delay, pad the input audio with silence at the end to make sure we stream the entire output
         if separator.config.delay_secs > 0.0:
@@ -82,13 +89,14 @@ def main(args: argparse.Namespace):
             input_audio = np.concatenate([input_audio, np.zeros(delay_samples, dtype=np.float32)])
 
         # Do the separation
-        for start in trange(0, input_audio.shape[-1], separator.chunk_size_samples, desc=f"Processing {os.path.basename(input_file)}"):
+        input_file_rel = os.path.relpath(input_file, args.input_dir)
+        for start in trange(0, input_audio.shape[-1], separator.chunk_size_samples, desc=f"Processing {input_file_rel}"):
             end = start + separator.chunk_size_samples
             chunk = input_audio[start:end]
             chunk = pad_or_trim(chunk, separator.chunk_size_samples)
             _ = separator.process_audio(chunk)
 
-        # Output the results
+        # Prepare to output the results
         output_audio = separator.get_stereo_audio_history()
         # If there is a delay, trim the silence at the front of the output audio
         if separator.config.delay_secs > 0.0:
@@ -103,47 +111,50 @@ def main(args: argparse.Namespace):
                 f"Output audio length ({output_audio.shape[-1]} samples; {(output_audio.shape[-1] / sr):.3f} secs) "
                 f"does not match input audio length ({input_audio_length} samples; {(input_audio_length / sr):.3f} secs)."
             )
-        output_file = os.path.splitext(input_file)[0] + "_separated.wav"
-        sf.write(output_file, output_audio.T, sr)
+
+        # Save the separated audio
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        save_audio(output_file, output_audio, sr)
         logger.info(f"Separated audio written to: {output_file}")
+
+        # Log profiler metrics for this output file
         separator.profilers.log(tag=output_file)
 
 if __name__ == "__main__":
+    default_config = RealtimeSeparatorConfig()
+
     parser = argparse.ArgumentParser("Run the Realtime Speech Separation CLI.")
     add_common_inference_args(parser)
-    default_config = RealtimeSeparatorConfig()
-    parser.add_argument("--input_file", type=str, default=None, help="Path to the enrollment audio file.")
-    parser.add_argument("--input_dir", type=str, default=None, help="Path to the input directory containing input/enrollment pairs.")
-    parser.add_argument("--enrollment_file", type=str, default=None, help="Path to the enrollment audio file.")
-    parser.add_argument("--delay_secs", type=float, default=default_config.delay_secs, help="Delay (seconds).")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (omit for random)")
-    parser.add_argument("--chunk_size_secs", type=float, default=1.0, help="Chunk size (seconds).")
-    parser.add_argument("--temperature", type=float, default=default_config.temperature, help="Temperature.")
-    parser.add_argument("--top_k", type=int, default=default_config.top_k, help="Top-k.")
-    parser.add_argument("--top_p", type=float, default=default_config.top_p, help="Top-p.")
-    parser.add_argument("--min_p", type=float, default=default_config.min_p, help="Min-p.")
-    parser.add_argument("--repeat_penalty", type=float, default=default_config.repeat_penalty, help="Repeat Penalty.")
-    parser.add_argument("--presence_penalty", type=float, default=default_config.presence_penalty, help="Presence Penalty.")
-    parser.add_argument("--frequency_penalty", type=float, default=default_config.frequency_penalty, help="Frequency Penalty.")
-    parser.add_argument("--max_context_secs", type=float, default=default_config.max_context_secs, help="Max Context Length (seconds).")
-    parser.add_argument("--trim_by_secs", type=float, default=default_config.trim_by_secs, help="Trim By (seconds).")
-    parser.add_argument("--run_profilers", action="store_true", help="Run Profilers.")
-    parser.add_argument("--log_level", type=str, default="WARNING", help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).")
+
+    input_group = parser.add_argument_group("Input Arguments")
+    input_group.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing input/enrollment pairs.")
+    input_group.add_argument("--input_filter", type=str, nargs="+", help="Filter for input files.")
+
+    inference_group = parser.add_argument_group("Inference Arguments")
+    inference_group.add_argument("--delay_secs", type=float, default=default_config.delay_secs, choices=SUPPORTED_DELAY_SECS, help="Delay (seconds).")
+    inference_group.add_argument("--seed", type=int, default=None, help="Random seed (omit for random).")
+    inference_group.add_argument("--chunk_size_secs", type=float, default=1.0, help="Chunk size (seconds).")
+    inference_group.add_argument("--temperature", type=float, default=default_config.temperature, help="Temperature.")
+    inference_group.add_argument("--top_k", type=int, default=default_config.top_k, help="Top-k.")
+    inference_group.add_argument("--top_p", type=float, default=default_config.top_p, help="Top-p.")
+    inference_group.add_argument("--min_p", type=float, default=default_config.min_p, help="Min-p.")
+    inference_group.add_argument("--repeat_penalty", type=float, default=default_config.repeat_penalty, help="Repeat Penalty.")
+    inference_group.add_argument("--presence_penalty", type=float, default=default_config.presence_penalty, help="Presence Penalty.")
+    inference_group.add_argument("--frequency_penalty", type=float, default=default_config.frequency_penalty, help="Frequency Penalty.")
+    inference_group.add_argument("--max_context_secs", type=float, default=default_config.max_context_secs, help="Max Context Length (seconds).")
+    inference_group.add_argument("--trim_by_secs", type=float, default=default_config.trim_by_secs, help="Trim By (seconds).")
+
+    output_group = parser.add_argument_group("Output Arguments")
+    output_group.add_argument("--output_format", type=str, default="mp3", choices=["wav", "mp3"], help="Output audio format (wav, mp3).")
+    output_group.add_argument("--overwrite", action="store_true", help="Overwrite existing output files.")
+
+    logging_group = parser.add_argument_group("Logging Arguments")
+    logging_group.add_argument("--run_profilers", action="store_true", help="Run Profilers.")
+    logging_group.add_argument("--log_level", type=str, default="WARNING", choices=list(logging.getLevelNamesMapping()), help="Logging level.")
     
     args = parser.parse_args()
 
-    if not args.input_file and not args.input_dir:
-        parser.error("You must specify either --input_file to separate a single audio file or --input_dir to separate a directory of audio files.")
-    if args.input_file and args.input_dir:
-        parser.error("You cannot specify both --input_file and --input_dir at the same time.")
-    if args.input_dir and args.enrollment_file:
-        parser.error("You cannot specify --enrollment_file when using --input_dir. The enrollments should be paired with the input files in the directory.")
-    if not args.delay_secs in SUPPORTED_DELAY_SECS:
-        parser.error(f"Unsupported delay_secs value: {args.delay_secs}. Supported values are: {SUPPORTED_DELAY_SECS}")
     log_level = logging.getLevelNamesMapping().get(args.log_level.upper())
-    if log_level is None:
-        parser.error(f"Invalid log level: {args.log_level}. Supported values are: DEBUG, INFO, WARNING, ERROR, CRITICAL")
-
     logging.basicConfig(level=log_level)
     logger.info(f"Running with args: {args}")
 
