@@ -10,6 +10,7 @@ from realtime_speech_separation import RealtimeSeparator, RealtimeSeparatorResou
 from realtime_speech_separation.utils.audio_utils import pad_or_trim, preprocess_enrollment_audio, save_audio
 from realtime_speech_separation.realtime_separator_config import SUPPORTED_DELAY_SECS
 from realtime_speech_separation.utils.data_utils import get_audio_files
+from realtime_speech_separation.utils.cli_utils import get_inference_args_hash
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,9 @@ def get_enrollment_file(input_file: str) -> str:
     file_name, ext = os.path.splitext(input_file)
     return f"{file_name}_enrollment{ext}"
 
-def get_output_file(input_file: str, output_format: str, delay_secs: float, seed: Optional[int]) -> str:
+def get_output_file(input_file: str, output_format: str, args_hash: str) -> str:
     file_name, _ = os.path.splitext(input_file)
-    return f"{file_name}_separated_delay_{delay_secs}_seed_{seed}.{output_format}"
+    return f"{file_name}_separated_{args_hash}.{output_format}"
 
 def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     input_audio, _ = librosa.load(input_file, sr=sr, mono=True, dtype=np.float32)
@@ -34,7 +35,7 @@ def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.n
         enrollment_audio, _ = librosa.load(enrollment_file, sr=sr, mono=True, dtype=np.float32)
     return input_audio, enrollment_audio
 
-def main(args: argparse.Namespace):
+def main(args: argparse.Namespace, args_hash: str):
     separator = RealtimeSeparator(
         resources=RealtimeSeparatorResources(
             llm_model_path=args.llm_model_path,
@@ -64,7 +65,7 @@ def main(args: argparse.Namespace):
     )
 
     for input_file in tqdm(input_files, desc="Processing input files"):
-        output_file = get_output_file(input_file, args.output_format, args.delay_secs, args.seed)
+        output_file = get_output_file(input_file, args.output_format, args_hash)
         if os.path.exists(output_file) and not args.overwrite:
             logger.info(f"Output file {output_file} already exists. Skipping.")
             continue
@@ -160,5 +161,10 @@ if __name__ == "__main__":
 
     if args.run_profilers and log_level > logging.INFO:
         logger.warning("Profilers are enabled but the log level is higher than INFO. Profiler outputs will not be visible.")
-    
-    main(args)
+
+    if args.seed is None:
+        logger.warning("No seed provided. Results will be non-deterministic.")
+
+    args_hash = get_inference_args_hash(parser, args)
+
+    main(args, args_hash)
