@@ -1,9 +1,8 @@
 from typing import Tuple, Union
-from pydub import AudioSegment
+import soundfile as sf
 import librosa
 import numpy as np
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -83,37 +82,13 @@ def preprocess_enrollment_audio(
         return sr, enroll_audio
     return enroll_audio
 
-def save_audio(path: str, audio: np.ndarray, sr: int, mp3_quality: int = 2) -> None:
-    if audio.ndim == 1:
-        channels = 1
-    elif audio.ndim == 2:
-        channels = audio.shape[0]
+def save_audio(path: str, audio: np.ndarray, sr: int) -> None:
+    if audio.ndim == 2:
         audio = audio.T  # (channels, samples) -> (samples, channels)
-    else:
+    elif audio.ndim > 2:
         raise ValueError("Expected mono or multichannel audio")
 
-    pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
+    if audio.dtype != np.float32:
+        raise ValueError("Audio must be of type float32")
 
-    segment = AudioSegment(
-        data=pcm.tobytes(),
-        sample_width=2,
-        frame_rate=sr,
-        channels=channels,
-    )
-
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".mp3":
-        segment.export(
-            path,
-            format="mp3",
-            codec="libmp3lame",
-            parameters=["-q:a", str(mp3_quality)],
-        )
-    elif ext == ".wav":
-        segment.export(
-            path,
-            format="wav",
-            codec="pcm_s16le",
-        )
-    else:
-        raise ValueError(f"Unsupported format: {ext}")
+    sf.write(path, audio, sr, subtype="FLOAT")

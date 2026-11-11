@@ -18,9 +18,9 @@ def get_enrollment_file(input_file: str) -> str:
     file_name, ext = os.path.splitext(input_file)
     return f"{file_name}_enrollment{ext}"
 
-def get_output_file(input_file: str, output_format: str, args_hash: str) -> str:
+def get_output_file(input_file: str, args_hash: str) -> str:
     file_name, _ = os.path.splitext(input_file)
-    return f"{file_name}_separated_{args_hash}.{output_format}"
+    return f"{file_name}_separated_{args_hash}.wav"
 
 def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     input_audio, _ = librosa.load(input_file, sr=sr, mono=True, dtype=np.float32)
@@ -65,7 +65,7 @@ def main(args: argparse.Namespace, args_hash: str):
     )
 
     for input_file in tqdm(input_files, desc="Processing input files"):
-        output_file = get_output_file(input_file, args.output_format, args_hash)
+        output_file = get_output_file(input_file, args_hash)
         if os.path.exists(output_file) and not args.overwrite:
             logger.info(f"Output file {output_file} already exists. Skipping.")
             continue
@@ -146,7 +146,6 @@ if __name__ == "__main__":
     inference_group.add_argument("--trim_by_secs", type=float, default=default_config.trim_by_secs, help="Trim By (seconds).")
 
     output_group = parser.add_argument_group("Output Arguments")
-    output_group.add_argument("--output_format", type=str, default="mp3", choices=["wav", "mp3"], help="Output audio format (wav, mp3).")
     output_group.add_argument("--overwrite", action="store_true", help="Overwrite existing output files.")
 
     logging_group = parser.add_argument_group("Logging Arguments")

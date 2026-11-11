@@ -27,9 +27,9 @@ def main(args: argparse.Namespace):
     # process all metadata entries
     for metadata in tqdm(metadata_list, desc="Processing metadata"):
         file_base = os.path.join(output_dir, metadata["file_id"], f"target_channel_{metadata['target_channel']}", str(metadata["example_index"]))
-        input_file = f"{file_base}.{args.output_format}"
-        enrollment_file = f"{file_base}_enrollment.{args.output_format}"
-        reference_file = f"{file_base}_reference.{args.output_format}"
+        input_file = f"{file_base}.wav"
+        enrollment_file = f"{file_base}_enrollment.wav"
+        reference_file = f"{file_base}_reference.wav"
 
         if os.path.exists(input_file) and os.path.exists(enrollment_file) and os.path.exists(reference_file):
             logger.info(f"All inference input files for file_id {metadata['file_id']} already exist. Skipping.")
@@ -64,7 +64,6 @@ if __name__ == "__main__":
 
     output_group = parser.add_argument_group("Output Arguments")
     output_group.add_argument("--output_dir", type=str, default="output/eval", help="Directory to save evaluation output audio.")
-    output_group.add_argument("--output_format", type=str, default="mp3", choices=["wav", "mp3"], help="Output audio format (wav, mp3).")
     output_group.add_argument("--sampling_p", type=float, default=1.0, help="Proportion of the dataset to extract for evaluation (0.0, 1.0].")
     output_group.add_argument("--sampling_seed", type=int, default=42, help="Random seed for sampling the dataset.")
 
