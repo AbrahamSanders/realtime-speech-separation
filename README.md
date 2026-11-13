@@ -61,6 +61,22 @@ rtss.eval \
     --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata
 ```
 
+### Usage Notes
+
+By default, `rtss.separate` and `rtss.eval` will skip any already processed files.
+To force re-processing, you can use the `--overwrite` flag with either command.
+
+You can also use the `--input_filter` flag to specify a subset of input files to process. 
+This can be useful when you only want to re-run inference or evaluation on specific files.
+This filter matches any part of the full input file path. For example:
+```bash
+rtss.separate \
+    --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata \
+    --input_filter "CallFriend_deu/5178" \
+    --overwrite
+```
+will re-process only the inputs within `output/eval/dataset_magicodec_131k_60s_dev_metadata/CallFriend_deu/5178`
+
 ## Development
 
 Run the checks in this environment:

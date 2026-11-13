@@ -52,6 +52,7 @@ def write_results(separated_file: str, results: Dict):
 def run_eval(args: argparse.Namespace) -> None:
     input_files = get_audio_files(
         args.input_dir, 
+        filter_include=args.input_filter, 
         filter_exclude=["_enrollment.", "_separated_", "_reference."],
     )
 
@@ -158,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
 
     input_group = parser.add_argument_group("Input Arguments")
     input_group.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing input/enrollment/reference/separated pairs.")
+    input_group.add_argument("--input_filter", type=str, nargs="+", help="Filter for input files.")
     input_group.add_argument("--sample_rate", type=int, default=16000, help="Sample rate to use when loading audio files.")
     input_group.add_argument("--compute_permutation", action="store_true", help="Whether to compute the optimal permutation for separated sources.")
 

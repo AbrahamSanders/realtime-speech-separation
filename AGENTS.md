@@ -46,6 +46,10 @@
   run only on-demand, not with common CI checks or after changing unrelated areas of the code.
 - In the project environment, run `python -m ruff check .`,
   `python -m ruff format --check .`, and `python -m pytest`.
+- To run small, isolated smoke tests using the inference and eval CLIs on existing dev set data, 
+  use the `--input_filter` flag to specify the relevant input files and the `--overwrite` flag to
+  force re-processing. It is also preferred to first copy any test input audio to a separate temp
+  location before running development smoke tests.
 
 ## GPU etiquette
 
