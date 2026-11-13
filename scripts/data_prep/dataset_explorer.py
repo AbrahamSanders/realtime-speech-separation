@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import streamlit as st
 
-from realtime_speech_separation.audio_tokenizer import AudioTokenizer
+from realtime_speech_separation import AudioTokenizer
 from realtime_speech_separation.utils.audio_utils import smooth_join, create_crossfade_ramps
 from realtime_speech_separation.utils.data_utils import try_load_original_audio
 

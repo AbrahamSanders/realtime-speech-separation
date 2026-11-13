@@ -1,4 +1,4 @@
-from realtime_speech_separation.audio_tokenizer import AudioTokenizer
+from realtime_speech_separation import AudioTokenizer
 import torch
 import argparse
 

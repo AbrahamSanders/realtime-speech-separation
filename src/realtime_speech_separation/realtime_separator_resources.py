@@ -3,7 +3,7 @@ import os
 from typing import Union, Optional
 from transformers import AutoTokenizer
 
-from .audio_tokenizer import AudioTokenizer
+from . import AudioTokenizer
 from .utils.llamacpp_utils import LlamaForAlternatingCodeChannels
 
 class RealtimeSeparatorResources:

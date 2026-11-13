@@ -4,10 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List
 
-from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
-from .realtime_separator_resources import RealtimeSeparatorResources
-from .realtime_separator_config import RealtimeSeparatorConfig
+from . import RealtimeSeparatorResources, RealtimeSeparatorConfig
 from .realtime_separator_profiler import RealtimeSeparatorProfilerCollection
+from .utils.audio_utils import smooth_join, create_crossfade_ramps, pad_or_trim
 
 class RealtimeSeparator:
     def __init__(self, resources: RealtimeSeparatorResources = None, config: RealtimeSeparatorConfig = None):

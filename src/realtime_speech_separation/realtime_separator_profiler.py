@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from typing import List, Tuple, Optional
 
-from .realtime_separator_config import RealtimeSeparatorConfig
+from . import RealtimeSeparatorConfig
 
 logger = logging.getLogger(__name__)
 

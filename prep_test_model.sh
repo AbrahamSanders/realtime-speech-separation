@@ -15,7 +15,7 @@ cp $CHECKPOINT_DIR/*.json $TEST_MODEL_DIR
 cp $CHECKPOINT_DIR/*.safetensors $TEST_MODEL_DIR
 
 # run the persist script
-python persist_codec_embeddings.py \
+python scripts/training/persist_codec_embeddings.py \
     --model_path $TEST_MODEL_DIR \
     --codec_embed_file codec_embed_MagiCodec-50Hz-Base.pt \
     --save_vanilla

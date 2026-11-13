@@ -9,7 +9,7 @@ import json
 from tqdm import tqdm
 from asteroid.metrics import get_metrics
 
-from realtime_speech_separation.utils.data_utils import get_audio_files
+from .utils.data_utils import get_audio_files
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ def write_results(separated_file: str, results: Dict):
     with open(results_file, "w") as f:
         json.dump(results, f, indent=4)
 
-def main(args: argparse.Namespace):
+def run_eval(args: argparse.Namespace) -> None:
     input_files = get_audio_files(
         args.input_dir, 
         filter_exclude=["_enrollment.", "_separated_", "_reference."],
@@ -121,10 +121,12 @@ def main(args: argparse.Namespace):
                 "mean": metric_vals.mean(axis=0).tolist(),
                 "sd": metric_vals.std(axis=0).tolist(),
                 "min": metric_vals.min(axis=0).tolist(),
+                "max": metric_vals.max(axis=0).tolist(),
+                "p10": np.percentile(metric_vals, 10, axis=0).tolist(),
                 "q1": np.percentile(metric_vals, 25, axis=0).tolist(),
                 "median": np.percentile(metric_vals, 50, axis=0).tolist(),
                 "q3": np.percentile(metric_vals, 75, axis=0).tolist(),
-                "max": metric_vals.max(axis=0).tolist()
+                "p90": np.percentile(metric_vals, 90, axis=0).tolist(),
             }
 
         # Other stats
@@ -149,8 +151,10 @@ def main(args: argparse.Namespace):
         df = pd.DataFrame(csv_rows)
         df.to_csv(csv_filename, index=False)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Run the Speech Separation Evaluation.")
+def main(argv: list[str] | None = None) -> int:
+    """Run the Speech Separation Evaluation."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
 
     input_group = parser.add_argument_group("Input Arguments")
     input_group.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing input/enrollment/reference/separated pairs.")
@@ -163,10 +167,15 @@ if __name__ == "__main__":
     logging_group = parser.add_argument_group("Logging Arguments")
     logging_group.add_argument("--log_level", type=str, default="WARNING", choices=list(logging.getLevelNamesMapping()), help="Logging level.")
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     log_level = logging.getLevelNamesMapping().get(args.log_level.upper())
     logging.basicConfig(level=log_level)
     logger.info(f"Running with args: {args}")
 
-    main(args)
+    run_eval(args)
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

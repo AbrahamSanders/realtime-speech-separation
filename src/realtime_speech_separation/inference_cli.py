@@ -6,11 +6,11 @@ import librosa
 import os
 from tqdm import tqdm, trange
 
-from realtime_speech_separation import RealtimeSeparator, RealtimeSeparatorResources, RealtimeSeparatorConfig, add_common_inference_args
-from realtime_speech_separation.utils.audio_utils import pad_or_trim, preprocess_enrollment_audio, save_audio
-from realtime_speech_separation.realtime_separator_config import SUPPORTED_DELAY_SECS
-from realtime_speech_separation.utils.data_utils import get_audio_files
-from realtime_speech_separation.utils.cli_utils import get_inference_args_hash
+from . import RealtimeSeparator, RealtimeSeparatorResources, RealtimeSeparatorConfig, add_common_inference_args
+from .realtime_separator_config import SUPPORTED_DELAY_SECS
+from .utils.audio_utils import pad_or_trim, preprocess_enrollment_audio, save_audio
+from .utils.data_utils import get_audio_files
+from .utils.cli_utils import get_inference_args_hash
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.n
         enrollment_audio, _ = librosa.load(enrollment_file, sr=sr, mono=True, dtype=np.float32)
     return input_audio, enrollment_audio
 
-def main(args: argparse.Namespace, args_hash: str):
+def run_inference(args: argparse.Namespace, args_hash: str) -> None:
     separator = RealtimeSeparator(
         resources=RealtimeSeparatorResources(
             llm_model_path=args.llm_model_path,
@@ -121,10 +121,12 @@ def main(args: argparse.Namespace, args_hash: str):
         # Log profiler metrics for this output file
         separator.profilers.log(tag=output_file)
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Run the Realtime Speech Separation CLI."""
+
     default_config = RealtimeSeparatorConfig()
 
-    parser = argparse.ArgumentParser("Run the Realtime Speech Separation CLI.")
+    parser = argparse.ArgumentParser(description=__doc__)
     add_common_inference_args(parser)
 
     input_group = parser.add_argument_group("Input Arguments")
@@ -152,7 +154,7 @@ if __name__ == "__main__":
     logging_group.add_argument("--run_profilers", action="store_true", help="Run Profilers.")
     logging_group.add_argument("--log_level", type=str, default="WARNING", choices=list(logging.getLevelNamesMapping()), help="Logging level.")
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     log_level = logging.getLevelNamesMapping().get(args.log_level.upper())
     logging.basicConfig(level=log_level)
@@ -166,4 +168,9 @@ if __name__ == "__main__":
 
     args_hash = get_inference_args_hash(parser, args)
 
-    main(args, args_hash)
+    run_inference(args, args_hash)
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

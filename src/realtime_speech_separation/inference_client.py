@@ -5,9 +5,9 @@ import argparse
 import logging
 import matplotlib.pyplot as plt
 
-from realtime_speech_separation import RealtimeSeparator, RealtimeSeparatorResources, add_common_inference_args
-from realtime_speech_separation.utils.audio_utils import pad_or_trim, to_resampled_mono, preprocess_enrollment_audio
-from realtime_speech_separation.realtime_separator_config import SUPPORTED_DELAY_SECS
+from . import RealtimeSeparator, RealtimeSeparatorResources, add_common_inference_args
+from .utils.audio_utils import pad_or_trim, to_resampled_mono, preprocess_enrollment_audio
+from .realtime_separator_config import SUPPORTED_DELAY_SECS
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +92,13 @@ def run_separator(
             elif realtime_plot is not None:
                 yield realtime_plot, None, None
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Run the Realtime Speech Separation debug interface.")
+def main(argv: list[str] | None = None) -> int:
+    """Run the Realtime Speech Separation gradio client."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
     add_common_inference_args(parser)
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     print(f"Running with args: {args}")
     logging.basicConfig(level=logging.INFO)
 
@@ -140,3 +142,8 @@ if __name__ == "__main__":
         allow_flagging='never'
     )
     interface.launch()
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
