@@ -1,28 +1,36 @@
-from typing import Tuple, Optional
-import numpy as np
 import argparse
 import logging
-import librosa
 import os
+
+import librosa
+import numpy as np
 from tqdm import tqdm, trange
 
-from . import RealtimeSeparator, RealtimeSeparatorResources, RealtimeSeparatorConfig, add_common_inference_args
+from . import (
+    RealtimeSeparator,
+    RealtimeSeparatorConfig,
+    RealtimeSeparatorResources,
+    add_common_inference_args,
+)
 from .realtime_separator_config import SUPPORTED_DELAY_SECS
 from .utils.audio_utils import pad_or_trim, preprocess_enrollment_audio, save_audio
-from .utils.data_utils import get_audio_files
 from .utils.cli_utils import get_inference_args_hash
+from .utils.data_utils import get_audio_files
 
 logger = logging.getLogger(__name__)
+
 
 def get_enrollment_file(input_file: str) -> str:
     file_name, ext = os.path.splitext(input_file)
     return f"{file_name}_enrollment{ext}"
 
+
 def get_output_file(input_file: str, args_hash: str) -> str:
     file_name, _ = os.path.splitext(input_file)
     return f"{file_name}_separated_{args_hash}.wav"
 
-def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+
+def load_audio_file(input_file: str, sr: int) -> tuple[np.ndarray, np.ndarray | None]:
     input_audio, _ = librosa.load(input_file, sr=sr, mono=True, dtype=np.float32)
     enrollment_file = get_enrollment_file(input_file)
     if not os.path.exists(enrollment_file):
@@ -34,6 +42,7 @@ def load_audio_file(input_file: str, sr: int) -> Tuple[np.ndarray, Optional[np.n
     else:
         enrollment_audio, _ = librosa.load(enrollment_file, sr=sr, mono=True, dtype=np.float32)
     return input_audio, enrollment_audio
+
 
 def run_inference(args: argparse.Namespace, args_hash: str) -> None:
     separator = RealtimeSeparator(
@@ -53,14 +62,14 @@ def run_inference(args: argparse.Namespace, args_hash: str) -> None:
             max_context_secs=args.max_context_secs,
             trim_by_secs=args.trim_by_secs,
             seed=args.seed,
-            run_profilers=args.run_profilers
+            run_profilers=args.run_profilers,
         ),
     )
 
     sr = separator.resources.mono_audio_tokenizer.sampling_rate
     input_files = get_audio_files(
-        args.input_dir, 
-        filter_include=args.input_filter, 
+        args.input_dir,
+        filter_include=args.input_filter,
         filter_exclude=["_enrollment.", "_separated_", "_reference."],
     )
 
@@ -74,10 +83,12 @@ def run_inference(args: argparse.Namespace, args_hash: str) -> None:
 
         # Load the input audio and corresponding enrollment audio
         input_audio, enrollment_audio = load_audio_file(input_file, sr)
-        
+
         # Apply the new enrollment & Reset separator context
         if enrollment_audio is not None:
-            separator.config.target_voice_enrollment = preprocess_enrollment_audio((sr, enrollment_audio), sr, return_tuple=True)
+            separator.config.target_voice_enrollment = preprocess_enrollment_audio(
+                (sr, enrollment_audio), sr, return_tuple=True
+            )
         else:
             separator.config.target_voice_enrollment = None
         separator.reset()
@@ -91,7 +102,12 @@ def run_inference(args: argparse.Namespace, args_hash: str) -> None:
 
         # Do the separation
         input_file_rel = os.path.relpath(input_file, args.input_dir)
-        for start in trange(0, input_audio.shape[-1], separator.chunk_size_samples, desc=f"Processing {input_file_rel}"):
+        for start in trange(
+            0,
+            input_audio.shape[-1],
+            separator.chunk_size_samples,
+            desc=f"Processing {input_file_rel}",
+        ):
             end = start + separator.chunk_size_samples
             chunk = input_audio[start:end]
             chunk = pad_or_trim(chunk, separator.chunk_size_samples)
@@ -121,6 +137,7 @@ def run_inference(args: argparse.Namespace, args_hash: str) -> None:
         # Log profiler metrics for this output file
         separator.profilers.log(tag=output_file)
 
+
 def main(argv: list[str] | None = None) -> int:
     """Run the Realtime Speech Separation CLI."""
 
@@ -130,30 +147,77 @@ def main(argv: list[str] | None = None) -> int:
     add_common_inference_args(parser)
 
     input_group = parser.add_argument_group("Input Arguments")
-    input_group.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing input/enrollment pairs.")
+    input_group.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Path to the input directory containing input/enrollment pairs.",
+    )
     input_group.add_argument("--input_filter", type=str, nargs="+", help="Filter for input files.")
 
     inference_group = parser.add_argument_group("Inference Arguments")
-    inference_group.add_argument("--delay_secs", type=float, default=default_config.delay_secs, choices=SUPPORTED_DELAY_SECS, help="Delay (seconds).")
+    inference_group.add_argument(
+        "--delay_secs",
+        type=float,
+        default=default_config.delay_secs,
+        choices=SUPPORTED_DELAY_SECS,
+        help="Delay (seconds).",
+    )
     inference_group.add_argument("--seed", type=int, default=None, help="Random seed (omit for random).")
     inference_group.add_argument("--chunk_size_secs", type=float, default=1.0, help="Chunk size (seconds).")
-    inference_group.add_argument("--temperature", type=float, default=default_config.temperature, help="Temperature.")
+    inference_group.add_argument(
+        "--temperature",
+        type=float,
+        default=default_config.temperature,
+        help="Temperature.",
+    )
     inference_group.add_argument("--top_k", type=int, default=default_config.top_k, help="Top-k.")
     inference_group.add_argument("--top_p", type=float, default=default_config.top_p, help="Top-p.")
     inference_group.add_argument("--min_p", type=float, default=default_config.min_p, help="Min-p.")
-    inference_group.add_argument("--repeat_penalty", type=float, default=default_config.repeat_penalty, help="Repeat Penalty.")
-    inference_group.add_argument("--presence_penalty", type=float, default=default_config.presence_penalty, help="Presence Penalty.")
-    inference_group.add_argument("--frequency_penalty", type=float, default=default_config.frequency_penalty, help="Frequency Penalty.")
-    inference_group.add_argument("--max_context_secs", type=float, default=default_config.max_context_secs, help="Max Context Length (seconds).")
-    inference_group.add_argument("--trim_by_secs", type=float, default=default_config.trim_by_secs, help="Trim By (seconds).")
+    inference_group.add_argument(
+        "--repeat_penalty",
+        type=float,
+        default=default_config.repeat_penalty,
+        help="Repeat Penalty.",
+    )
+    inference_group.add_argument(
+        "--presence_penalty",
+        type=float,
+        default=default_config.presence_penalty,
+        help="Presence Penalty.",
+    )
+    inference_group.add_argument(
+        "--frequency_penalty",
+        type=float,
+        default=default_config.frequency_penalty,
+        help="Frequency Penalty.",
+    )
+    inference_group.add_argument(
+        "--max_context_secs",
+        type=float,
+        default=default_config.max_context_secs,
+        help="Max Context Length (seconds).",
+    )
+    inference_group.add_argument(
+        "--trim_by_secs",
+        type=float,
+        default=default_config.trim_by_secs,
+        help="Trim By (seconds).",
+    )
 
     output_group = parser.add_argument_group("Output Arguments")
     output_group.add_argument("--overwrite", action="store_true", help="Overwrite existing output files.")
 
     logging_group = parser.add_argument_group("Logging Arguments")
     logging_group.add_argument("--run_profilers", action="store_true", help="Run Profilers.")
-    logging_group.add_argument("--log_level", type=str, default="WARNING", choices=list(logging.getLevelNamesMapping()), help="Logging level.")
-    
+    logging_group.add_argument(
+        "--log_level",
+        type=str,
+        default="WARNING",
+        choices=list(logging.getLevelNamesMapping()),
+        help="Logging level.",
+    )
+
     args = parser.parse_args(argv)
 
     log_level = logging.getLevelNamesMapping().get(args.log_level.upper())
@@ -161,7 +225,9 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(f"Running with args: {args}")
 
     if args.run_profilers and log_level > logging.INFO:
-        logger.warning("Profilers are enabled but the log level is higher than INFO. Profiler outputs will not be visible.")
+        logger.warning(
+            "Profilers are enabled but the log level is higher than INFO. Profiler outputs will not be visible."
+        )
 
     if args.seed is None:
         logger.warning("No seed provided. Results will be non-deterministic.")
@@ -171,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     run_inference(args, args_hash)
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

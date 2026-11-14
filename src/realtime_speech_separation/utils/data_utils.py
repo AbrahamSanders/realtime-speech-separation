@@ -1,16 +1,16 @@
 import os
-from typing import Dict, Optional, Tuple, Union, List
 
 import librosa
 import numpy as np
 
 RAW_AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".opus"]
 
+
 def try_load_original_audio(
-    metadata: Dict, 
-    raw_audio_dir: str, 
-    length_secs: Optional[float] = None, 
-) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
+    metadata: dict,
+    raw_audio_dir: str,
+    length_secs: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
     m = metadata
     for ext in RAW_AUDIO_EXTENSIONS:
         audio_path = os.path.join(raw_audio_dir, f"{m['file_id']}{ext}")
@@ -20,14 +20,32 @@ def try_load_original_audio(
         # target voice audio
         tv_length_secs = m["tv_end_secs"] - m["tv_start_secs"]
         tv_length_secs = min(length_secs, tv_length_secs) if length_secs else tv_length_secs
-        tv_audio, tv_sr = librosa.load(audio_path, sr=None, mono=False, offset=m["tv_start_secs"], duration=tv_length_secs)
+        tv_audio, tv_sr = librosa.load(
+            audio_path,
+            sr=None,
+            mono=False,
+            offset=m["tv_start_secs"],
+            duration=tv_length_secs,
+        )
         tv_audio = tv_audio[m["target_channel"]]
 
         # example audio
         ex_length_secs = m["ex_end_secs"] - m["ex_start_secs"]
         ex_length_secs = min(length_secs, ex_length_secs) if length_secs else ex_length_secs
-        ex_audio_mono, ex_sr_mono = librosa.load(audio_path, sr=None, mono=True, offset=m["ex_start_secs"], duration=ex_length_secs)
-        ex_audio_stereo, ex_sr_stereo = librosa.load(audio_path, sr=None, mono=False, offset=m["ex_start_secs"], duration=ex_length_secs)
+        ex_audio_mono, ex_sr_mono = librosa.load(
+            audio_path,
+            sr=None,
+            mono=True,
+            offset=m["ex_start_secs"],
+            duration=ex_length_secs,
+        )
+        ex_audio_stereo, ex_sr_stereo = librosa.load(
+            audio_path,
+            sr=None,
+            mono=False,
+            offset=m["ex_start_secs"],
+            duration=ex_length_secs,
+        )
         # make sure target channel is in position 0 in ex_audio_stereo
         if m["target_channel"] != 0:
             ex_audio_stereo = ex_audio_stereo[::-1]
@@ -35,15 +53,16 @@ def try_load_original_audio(
         sr = tv_sr
         if sr != ex_sr_mono or sr != ex_sr_stereo:
             raise ValueError("Sample rates of target voice and example audio do not match.")
-        
+
         return tv_audio, ex_audio_mono, ex_audio_stereo, sr
     return None
 
+
 def get_audio_files(
-    path: str, 
-    filter_include: Optional[Union[str, List[str]]] = None, 
-    filter_exclude: Optional[Union[str, List[str]]] = None,
-) -> List[str]:
+    path: str,
+    filter_include: str | list[str] | None = None,
+    filter_exclude: str | list[str] | None = None,
+) -> list[str]:
     if isinstance(filter_include, str):
         filter_include = [filter_include]
     filter_include = [f.lower() for f in filter_include] if filter_include else []

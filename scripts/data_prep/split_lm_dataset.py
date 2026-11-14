@@ -1,18 +1,37 @@
 import argparse
-import pandas as pd
-import jsonlines
 import os
+
+import jsonlines
+import pandas as pd
 from tqdm import tqdm
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Split the speech separation dataset into train, dev, and test sets.")
     parser.add_argument("--dataset_path", type=str, required=True)
-    parser.add_argument("--file_splits_csv", type=str, default=None, 
-        help="Path to a CSV file containing file splits. If provided, will use this instead of the ratio arguments."
+    parser.add_argument(
+        "--file_splits_csv",
+        type=str,
+        default=None,
+        help="Path to a CSV file containing file splits. If provided, will use this instead of the ratio arguments.",
     )
-    parser.add_argument("--train_ratio", type=float, default=0.85, help="Proportion of data to use for training.")
-    parser.add_argument("--dev_ratio", type=float, default=0.05, help="Proportion of data to use for development.")
-    parser.add_argument("--test_ratio", type=float, default=0.1, help="Proportion of data to use for testing.")
+    parser.add_argument(
+        "--train_ratio",
+        type=float,
+        default=0.85,
+        help="Proportion of data to use for training.",
+    )
+    parser.add_argument(
+        "--dev_ratio",
+        type=float,
+        default=0.05,
+        help="Proportion of data to use for development.",
+    )
+    parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.1,
+        help="Proportion of data to use for testing.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling the dataset.")
     args = parser.parse_args()
 
@@ -84,7 +103,7 @@ if __name__ == "__main__":
     test_path = args.dataset_path.replace(".txt", "_test.txt")
     test_metadata_path = args.dataset_path.replace(".txt", "_test_metadata.jsonl")
     with (
-        open(args.dataset_path, "r", encoding="utf-8") as f,
+        open(args.dataset_path, encoding="utf-8") as f,
         open(train_path, "w", encoding="utf-8") as f_train,
         open(dev_path, "w", encoding="utf-8") as f_dev,
         open(test_path, "w", encoding="utf-8") as f_test,
@@ -92,9 +111,8 @@ if __name__ == "__main__":
         jsonlines.open(train_metadata_path, "w") as f_train_meta,
         jsonlines.open(dev_metadata_path, "w") as f_dev_meta,
         jsonlines.open(test_metadata_path, "w") as f_test_meta,
-        
     ):
-        for line, line_meta in tqdm(zip(f, f_meta)):
+        for line, line_meta in tqdm(zip(f, f_meta, strict=False)):
             # get the split for the current line
             file_id = line_meta["file_id"]
             split = file_splits_df.loc[file_id, "split"]

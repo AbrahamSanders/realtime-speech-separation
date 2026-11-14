@@ -1,12 +1,19 @@
-from typing import Tuple, Union
-import soundfile as sf
+import logging
+
 import librosa
 import numpy as np
-import logging
+import soundfile as sf
 
 logger = logging.getLogger(__name__)
 
-def smooth_join(chunk1: np.ndarray, chunk2: np.ndarray, L: int, fade_in: np.ndarray, fade_out: np.ndarray) -> np.ndarray:
+
+def smooth_join(
+    chunk1: np.ndarray,
+    chunk2: np.ndarray,
+    L: int,
+    fade_in: np.ndarray,
+    fade_out: np.ndarray,
+) -> np.ndarray:
     if chunk1.shape[-1] == 0:
         return chunk2
     if L == 0:
@@ -21,18 +28,20 @@ def smooth_join(chunk1: np.ndarray, chunk2: np.ndarray, L: int, fade_in: np.ndar
 
     return np.concatenate((head1, cross, tail2), axis=-1)
 
-def create_crossfade_ramps(sr: int, fade_secs: float) -> Tuple[int, np.ndarray, np.ndarray]:
+
+def create_crossfade_ramps(sr: int, fade_secs: float) -> tuple[int, np.ndarray, np.ndarray]:
     L = int(sr * fade_secs)
     fade_in = np.sin(0.5 * np.pi * np.linspace(0, 1, L, endpoint=False, dtype=np.float32))
     fade_out = fade_in[::-1]
     return L, fade_in, fade_out
+
 
 def pad_or_trim(chunk: np.ndarray, target_length: int, pad_side: str = "right") -> np.ndarray:
     if chunk.ndim > 2:
         raise ValueError("Input chunk must be a 1D or 2D array.")
     if chunk.shape[-1] < target_length:
         # Pad with zeros at the end
-        pad_width = target_length-chunk.shape[-1]
+        pad_width = target_length - chunk.shape[-1]
         pad_width = (0, pad_width) if pad_side == "right" else (pad_width, 0)
         if chunk.ndim == 2:
             pad_width = ((0, 0), pad_width)
@@ -43,11 +52,12 @@ def pad_or_trim(chunk: np.ndarray, target_length: int, pad_side: str = "right") 
     else:
         return chunk
 
+
 def to_resampled_mono(
-    input_audio: Tuple[int, np.ndarray], 
-    target_sr: int, 
+    input_audio: tuple[int, np.ndarray],
+    target_sr: int,
     return_tuple: bool = False,
-) -> Union[Tuple[int, np.ndarray], np.ndarray]:
+) -> tuple[int, np.ndarray] | np.ndarray:
     sr, input_audio = input_audio
     if input_audio.dtype == np.int16:
         input_audio = input_audio.astype("float32") / 32768.0
@@ -61,18 +71,19 @@ def to_resampled_mono(
         return target_sr, input_audio
     return input_audio
 
+
 def preprocess_enrollment_audio(
-    enrollment_audio: Tuple[int, np.ndarray], 
-    target_sr: int, 
+    enrollment_audio: tuple[int, np.ndarray],
+    target_sr: int,
     min_length_secs: float = 2.0,
     max_length_secs: float = 10.0,
     return_tuple: bool = False,
-) -> Union[Tuple[int, np.ndarray], np.ndarray]:
+) -> tuple[int, np.ndarray] | np.ndarray:
     if enrollment_audio is None:
         return None
     sr, enroll_audio = to_resampled_mono(enrollment_audio, target_sr, return_tuple=True)
     if enroll_audio.shape[-1] > int(max_length_secs * sr):
-        enroll_audio = enroll_audio[:int(max_length_secs * sr)]
+        enroll_audio = enroll_audio[: int(max_length_secs * sr)]
         logger.info(f"Trimmed enrollment audio to {max_length_secs} seconds.")
     elif enroll_audio.shape[-1] < int(min_length_secs * sr):
         pad_length = int(min_length_secs * sr) - enroll_audio.shape[-1]
@@ -81,6 +92,7 @@ def preprocess_enrollment_audio(
     if return_tuple:
         return sr, enroll_audio
     return enroll_audio
+
 
 def save_audio(path: str, audio: np.ndarray, sr: int) -> None:
     if audio.ndim == 2:

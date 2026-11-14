@@ -1,20 +1,22 @@
-import torch
-import librosa
-import numpy as np
 import itertools
 import math
-from typing import Optional, Tuple, Union, Any
-from codec_bpe import codes_to_chars, chars_to_codes, UNICODE_OFFSET_LARGE
+from typing import Any
+
+import librosa
+import numpy as np
+import torch
+from codec_bpe import UNICODE_OFFSET_LARGE, chars_to_codes, codes_to_chars
 from codec_bpe.tools.codec_utils import load_magicodec_model
+
 
 class AudioTokenizer:
     def __init__(
-        self, 
-        codec_model: Union[str, Any] = "MagiCodec-50Hz-Base", 
-        num_channels: int = 1, 
+        self,
+        codec_model: str | Any = "MagiCodec-50Hz-Base",
+        num_channels: int = 1,
         context_secs: float = 2.0,
         unicode_offset: int = UNICODE_OFFSET_LARGE,
-        device: Optional[Union[str, torch.device]] = None, 
+        device: str | torch.device | None = None,
     ):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,7 +51,7 @@ class AudioTokenizer:
         secs = len(audio_codes_str) / (self.framerate * self.num_channels)
         return secs
 
-    def chunked_tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray], chunk_size_secs: float) -> str:
+    def chunked_tokenize_audio(self, audio: tuple[int, np.ndarray] | np.ndarray, chunk_size_secs: float) -> str:
         if isinstance(audio, np.ndarray):
             sr = self.sampling_rate
         else:
@@ -65,35 +67,36 @@ class AudioTokenizer:
         return audio_codes_str
 
     @torch.inference_mode()
-    def tokenize_audio(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> str:
+    def tokenize_audio(self, audio: tuple[int, np.ndarray] | np.ndarray) -> str:
         audio = self._prep_audio_for_tokenization(audio)
-            
+
         # append audio to the context
         self.tokenize_context = np.concatenate((self.tokenize_context, audio.reshape(self.num_channels, -1)), axis=-1)
         # trim the context to the max context size or audio size, whichever is larger
-        self.tokenize_context = self.tokenize_context[..., -max(audio.shape[-1], self.context_samples):]
-        
+        self.tokenize_context = self.tokenize_context[..., -max(audio.shape[-1], self.context_samples) :]
+
         # get audio codes
         input_audio = torch.tensor(self.tokenize_context).to(self.device)
         with torch.autocast(
-            device_type = "cuda",
-            dtype = torch.bfloat16,
-            enabled = self.autocast_bfloat16,
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self.autocast_bfloat16,
         ):
             encoder_outputs = torch.cat(
-                [self._magicodec_encode(channel.unsqueeze(0)) for channel in input_audio], 
+                [self._magicodec_encode(channel.unsqueeze(0)) for channel in input_audio],
                 dim=0,
             )
 
         # convert to unicode string
         channels_chars = [
             codes_to_chars(
-                ch_codes, 
-                self.codebook_size, 
+                ch_codes,
+                self.codebook_size,
                 unicode_offset=self.unicode_offset,
-            ) for ch_codes in encoder_outputs
+            )
+            for ch_codes in encoder_outputs
         ]
-        audio_codes_str = "".join(list(itertools.chain.from_iterable(zip(*channels_chars))))
+        audio_codes_str = "".join(list(itertools.chain.from_iterable(zip(*channels_chars, strict=False))))
 
         # discard context codes that come before the audio we are tokenizing
         audio_secs = audio.shape[-1] / self.sampling_rate
@@ -103,38 +106,41 @@ class AudioTokenizer:
         return audio_codes_str
 
     @torch.inference_mode()
-    def detokenize_audio(self, audio_codes_str: str, preroll_samples: int = 0) -> Tuple[Tuple[int, np.ndarray], str, int]:
+    def detokenize_audio(
+        self, audio_codes_str: str, preroll_samples: int = 0
+    ) -> tuple[tuple[int, np.ndarray], str, int]:
         # make sure len(audio_codes_str) is divisible by num_channels
         audio_codes_str, end_hanging = self._drop_hanging_channel_codes(audio_codes_str)
-        
+
         # append audio codes to the context
         self.detokenize_context += audio_codes_str
         # trim the context to the max context size or audio codes size, whichever is larger
-        self.detokenize_context = self.detokenize_context[-max(len(audio_codes_str), self.context_frames):]
+        self.detokenize_context = self.detokenize_context[-max(len(audio_codes_str), self.context_frames) :]
 
         # split the audio codes into channels
-        input_audio_codes_str = [self.detokenize_context[i::self.num_channels] for i in range(self.num_channels)]
+        input_audio_codes_str = [self.detokenize_context[i :: self.num_channels] for i in range(self.num_channels)]
 
         # convert unicode string to audio codes
         input_audio_codes = [
             chars_to_codes(
-                ch_chars, 
-                self.num_codebooks, 
+                ch_chars,
+                self.num_codebooks,
                 self.codebook_size,
                 return_tensors="pt",
                 unicode_offset=self.unicode_offset,
-            ) for ch_chars in input_audio_codes_str
+            )
+            for ch_chars in input_audio_codes_str
         ]
         input_audio_codes = torch.stack(input_audio_codes).to(self.device)
-        
+
         # decode audio codes with codec
         with torch.autocast(
-            device_type = "cuda",
-            dtype = torch.bfloat16,
-            enabled = self.autocast_bfloat16,
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self.autocast_bfloat16,
         ):
             output_audio = torch.cat(
-                [self._magicodec_decode(ch_codes.unsqueeze(0)) for ch_codes in input_audio_codes], 
+                [self._magicodec_decode(ch_codes.unsqueeze(0)) for ch_codes in input_audio_codes],
                 dim=1,
             )
 
@@ -142,23 +148,27 @@ class AudioTokenizer:
         audio_secs = self.get_audio_codes_str_secs(audio_codes_str)
         audio_samples = int(audio_secs * self.sampling_rate) + preroll_samples
         output_audio = output_audio[..., -audio_samples:]
-        preroll_samples = max(0, preroll_samples-audio_samples+output_audio.shape[-1])
+        preroll_samples = max(0, preroll_samples - audio_samples + output_audio.shape[-1])
 
         # return audio
         output_audio = output_audio[0, 0] if self.num_channels == 1 else output_audio[0]
-        return (self.sampling_rate, output_audio.cpu().numpy()), end_hanging, preroll_samples
-    
+        return (
+            (self.sampling_rate, output_audio.cpu().numpy()),
+            end_hanging,
+            preroll_samples,
+        )
+
     @torch.inference_mode()
     def get_codec_embeddings(self) -> torch.Tensor:
         with torch.autocast(
-            device_type = "cuda",
-            dtype = torch.bfloat16,
-            enabled = self.autocast_bfloat16,
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self.autocast_bfloat16,
         ):
             codebook = self.codec_model.quantizer.codebook_proj(self.codec_model.quantizer.codebook.weight)
         return codebook
 
-    def _drop_hanging_channel_codes(self, audio_str: str) -> Tuple[str, str]:
+    def _drop_hanging_channel_codes(self, audio_str: str) -> tuple[str, str]:
         div_rem = len(audio_str) % self.num_channels
         if div_rem != 0:
             audio_str = audio_str[:-div_rem]
@@ -166,14 +176,14 @@ class AudioTokenizer:
         else:
             end_hanging = ""
         return audio_str, end_hanging
-    
+
     @torch.inference_mode()
     def _encode_silence(self, secs: float) -> torch.Tensor:
         audio = torch.zeros(int(secs * self.sampling_rate)).to(self.device)
         with torch.autocast(
-            device_type = "cuda",
-            dtype = torch.bfloat16,
-            enabled = self.autocast_bfloat16,
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self.autocast_bfloat16,
         ):
             audio_codes = self._magicodec_encode(audio.unsqueeze(0))
         return audio_codes
@@ -190,17 +200,17 @@ class AudioTokenizer:
         x = self.codec_model.pad_audio(x)
         z_e = self.codec_model.encoder(x)
         _, quantized_indices = self.codec_model.quantizer.inference(z_e)
-        quantized_indices = quantized_indices.unsqueeze(1) # add codebook dimension
+        quantized_indices = quantized_indices.unsqueeze(1)  # add codebook dimension
         return quantized_indices
-    
+
     def _magicodec_decode(self, codes: torch.Tensor) -> torch.Tensor:
-        codes = codes.squeeze(1) # remove codebook dimension
+        codes = codes.squeeze(1)  # remove codebook dimension
         codebook = self.codec_model.quantizer.codebook_proj(self.codec_model.quantizer.codebook.weight)
         z_q = torch.nn.functional.embedding(codes, codebook)
         recon = self.codec_model.decoder(z_q).float()
         return recon
-    
-    def _prep_audio_for_tokenization(self, audio: Union[Tuple[int, np.ndarray], np.ndarray]) -> np.ndarray:
+
+    def _prep_audio_for_tokenization(self, audio: tuple[int, np.ndarray] | np.ndarray) -> np.ndarray:
         if isinstance(audio, np.ndarray):
             orig_sr = self.sampling_rate
         else:

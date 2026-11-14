@@ -1,15 +1,17 @@
+import argparse
+import json
 import os
 import shutil
-import argparse
-import librosa
-import json
 from datetime import datetime
+
+import librosa
+from silero_vad import get_speech_timestamps, load_silero_vad
 from tqdm import tqdm
-from silero_vad import load_silero_vad, get_speech_timestamps
 
 from realtime_speech_separation.utils.data_utils import RAW_AUDIO_EXTENSIONS
 
 SAMPLE_RATE = 16000
+
 
 class VADResult:
     def __init__(self):
@@ -17,6 +19,7 @@ class VADResult:
         self.num_vad_files = 0
         self.num_skipped_dirs = 0
         self.errored_audio_files = []
+
 
 def main(args):
     model = load_silero_vad()
@@ -53,7 +56,13 @@ def main(args):
                 continue
 
             for channel in range(audio.shape[0]):
-                speech_timestamps = get_speech_timestamps(audio[channel], model, sampling_rate=SAMPLE_RATE, return_seconds=True, time_resolution=2)
+                speech_timestamps = get_speech_timestamps(
+                    audio[channel],
+                    model,
+                    sampling_rate=SAMPLE_RATE,
+                    return_seconds=True,
+                    time_resolution=2,
+                )
                 file_name_noext = os.path.basename(os.path.splitext(file_path)[0])
                 vad_filepath = os.path.join(vad_root, f"{file_name_noext}_c{channel}.json")
                 os.makedirs(os.path.dirname(vad_filepath), exist_ok=True)
@@ -71,7 +80,7 @@ def main(args):
 
     # Print summary
     print(f"Attempted to predict VAD in {result.num_audio_files} audio files:")
-    print(f"{result.num_audio_files-len(result.errored_audio_files)} Succeeded.")
+    print(f"{result.num_audio_files - len(result.errored_audio_files)} Succeeded.")
     print(f"{len(result.errored_audio_files)} Errored.")
     print(f"{result.num_vad_files} VAD files created.")
     print(f"{result.num_skipped_dirs} directories skipped.")
@@ -81,20 +90,40 @@ def main(args):
             print(file)
     print(f"Processing completed in {end_time - start_time}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Prepare VAD results needed to select channel-specific target voice samples for use during training"
     )
-    parser.add_argument("--audio_path", type=str, default="data/audio/raw", help="Directory containing the audio files")
-    parser.add_argument("--vad_path", type=str, default="data/vad", help="Directory to save the VAD results")
-    parser.add_argument("--extensions", nargs="+", default=RAW_AUDIO_EXTENSIONS,
+    parser.add_argument(
+        "--audio_path",
+        type=str,
+        default="data/audio/raw",
+        help="Directory containing the audio files",
+    )
+    parser.add_argument(
+        "--vad_path",
+        type=str,
+        default="data/vad",
+        help="Directory to save the VAD results",
+    )
+    parser.add_argument(
+        "--extensions",
+        nargs="+",
+        default=RAW_AUDIO_EXTENSIONS,
         help="Audio file extensions to convert. Formats must be supported by a librosa backend.",
     )
-    parser.add_argument("--audio_filter", nargs="+", 
+    parser.add_argument(
+        "--audio_filter",
+        nargs="+",
         help="Audio file filters. If provided, file paths must match one of the filters to be converted.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing VAD files")
-    parser.add_argument("--debug_num_files", type=int, help="Limit the number of audio files to process for debugging purposes")
+    parser.add_argument(
+        "--debug_num_files",
+        type=int,
+        help="Limit the number of audio files to process for debugging purposes",
+    )
     args = parser.parse_args()
 
     main(args)

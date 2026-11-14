@@ -3,7 +3,7 @@
 import json
 import subprocess
 import sys
-from importlib.metadata import metadata
+from importlib.metadata import distribution, metadata
 from pathlib import Path
 
 import realtime_speech_separation
@@ -24,7 +24,9 @@ def test_import_outside_repository(tmp_path: Path) -> None:
             sys.executable,
             "-I",
             "-c",
-            "import json, realtime_speech_separation; "
+            "import json, sys, realtime_speech_separation; "
+            "assert not {'torch', 'transformers', 'codec_bpe', 'llama_cpp', "
+            "'asteroid', 'gradio'} & sys.modules.keys(); "
             "print(json.dumps(realtime_speech_separation.__version__))",
         ],
         cwd=tmp_path,
@@ -35,3 +37,18 @@ def test_import_outside_repository(tmp_path: Path) -> None:
     )
 
     assert json.loads(result.stdout) == realtime_speech_separation.__version__
+
+
+def test_installed_console_scripts() -> None:
+    """Ensure dotted CLI names are registered as console entry points."""
+    entry_points = {
+        entry.name: entry.value
+        for entry in distribution("realtime-speech-separation").entry_points
+        if entry.group == "console_scripts"
+    }
+
+    assert entry_points == {
+        "rtss.separate": "realtime_speech_separation.inference_cli:main",
+        "rtss.client": "realtime_speech_separation.inference_client:main",
+        "rtss.eval": "realtime_speech_separation.eval_cli:main",
+    }

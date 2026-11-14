@@ -1,17 +1,16 @@
 import argparse
-import os
 import functools
-import jsonlines
-from tqdm import tqdm
+import os
 
-from realtime_speech_separation.lm_dataset_builder import LMDatasetBuilder, DELAY_TOKENS
+import jsonlines
 from codec_bpe import UNICODE_OFFSET_LARGE
 from codec_bpe.core.utils import get_codec_info, update_args_from_codec_info
+from tqdm import tqdm
+
+from realtime_speech_separation.lm_dataset_builder import DELAY_TOKENS, LMDatasetBuilder
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Build the speech separation training dataset"
-    )
+    parser = argparse.ArgumentParser(description="Build the speech separation training dataset")
     parser.add_argument("--codes_path", type=str, required=True)
     parser.add_argument("--vads_path", type=str, default="data/vads")
     parser.add_argument("--num_codebooks", type=int, default=None)
@@ -22,7 +21,11 @@ if __name__ == "__main__":
     parser.add_argument("--header_end_token", type=str, default="<|end_header|>")
     parser.add_argument("--skip_char", type=str, default="-")
     # handle hex values for unicode_offset with argparse: https://stackoverflow.com/a/25513044
-    parser.add_argument("--unicode_offset", type=functools.partial(int, base=0), default=UNICODE_OFFSET_LARGE)
+    parser.add_argument(
+        "--unicode_offset",
+        type=functools.partial(int, base=0),
+        default=UNICODE_OFFSET_LARGE,
+    )
     parser.add_argument("--context_secs", type=float, default=60.0)
     parser.add_argument("--overlap_secs", type=float, default=45.0)
     parser.add_argument("--voice_enrollment_max_secs", type=float, default=10.0)
@@ -30,8 +33,8 @@ if __name__ == "__main__":
     parser.add_argument("--voice_enrollment_hard_min_secs", type=float, default=2.0)
     parser.add_argument("--voice_enrollment_vad_merge_secs", type=float, default=1.0)
     parser.add_argument("--voice_enrollment_ideal_min_candidates", type=int, default=10)
-    parser.add_argument("--voice_enrollment_selection_seed", type=int, default=42 ** 2)
-    parser.add_argument("--delay_selection_seed", type=int, default=42 ** 3)
+    parser.add_argument("--voice_enrollment_selection_seed", type=int, default=42**2)
+    parser.add_argument("--delay_selection_seed", type=int, default=42**3)
     parser.add_argument("--save_path", type=str, default="output/lm_dataset.txt")
     parser.add_argument("--codes_filter", type=str, nargs="+")
     parser.add_argument("--codes_filter_exclude", type=str, nargs="+")
@@ -77,7 +80,10 @@ if __name__ == "__main__":
     with open(args.save_path, "w", encoding="utf-8") as f:
         with jsonlines.open(metadata_path, "w") as f_meta:
             example_iterator = lm_dataset_builder.iterate_examples(
-                args.codes_path, args.vads_path, args.codes_filter, args.codes_filter_exclude
+                args.codes_path,
+                args.vads_path,
+                args.codes_filter,
+                args.codes_filter_exclude,
             )
             for i, (example, metadata) in tqdm(enumerate(example_iterator), desc="Examples"):
                 if i == args.num_examples:
@@ -86,4 +92,3 @@ if __name__ == "__main__":
                 f.write("\n")
 
                 f_meta.write(metadata)
-            

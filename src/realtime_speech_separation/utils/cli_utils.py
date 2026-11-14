@@ -3,12 +3,14 @@ import hashlib
 import json
 import os
 
+
 def add_common_inference_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--llm_model_path", 
-        default="Qwen3-1.7B-magicodec-no-bpe-131k-test/Qwen3-1.7B-magicodec-no-bpe-131k-test-F16.gguf", 
+        "--llm_model_path",
+        default="Qwen3-1.7B-magicodec-no-bpe-131k-test/Qwen3-1.7B-magicodec-no-bpe-131k-test-F16.gguf",
         help="Path to the model GGUF file.",
     )
+
 
 def get_inference_args_hash(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
     # get inference group

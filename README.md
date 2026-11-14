@@ -29,12 +29,27 @@ The package supports Python 3.11+. In your preferred Python environment, install
 the package as follows, optionally including development dependencies:
 
 ```bash
-# Typical install
+# Core audio utilities
 python -m pip install -e .
 
-# Development install
+# Development install (used by CI)
 python -m pip install -e '.[dev]'
 ```
+
+Install the extras needed for your workflow:
+
+```bash
+python -m pip install -e '.[inference]'  # rtss.separate
+python -m pip install -e '.[client]'     # rtss.client (includes inference)
+python -m pip install -e '.[eval]'       # rtss.eval
+python -m pip install -e '.[training]'   # scripts/training
+python -m pip install -e '.[data]'       # scripts/data_prep and scripts/eval_prep
+```
+
+Inference, training, and codec-based data preparation also require the local
+`MagiCodec` clone described in [the architecture](docs/architecture.md).
+The base and development installs do not load models or require the optional
+runtime stacks. Python support for extras depends on their dependencies.
 
 ## Usage
 

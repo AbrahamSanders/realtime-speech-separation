@@ -1,15 +1,24 @@
+from typing import Unpack
+
 import torch
 from torch import nn
-from transformers.models.qwen3 import Qwen3Model, Qwen3ForCausalLM, Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm, Qwen3RotaryEmbedding
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3Model
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3DecoderLayer,
+    Qwen3RMSNorm,
+    Qwen3RotaryEmbedding,
+)
 from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.processing_utils import Unpack
+
 
 class CodecQwen3Config(Qwen3Config):
     def __init__(
@@ -19,7 +28,7 @@ class CodecQwen3Config(Qwen3Config):
         codebook_dim=16,
         projector_hidden_act="gelu",
         codec_vocab_start=0,
-        **kwargs
+        **kwargs,
     ):
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
@@ -27,6 +36,7 @@ class CodecQwen3Config(Qwen3Config):
         self.projector_hidden_act = projector_hidden_act
         self.codec_vocab_start = codec_vocab_start
         super().__init__(**kwargs)
+
 
 # Adapted from transformers.models.llava.modeling_llava.LlavaMultiModalProjector
 class CodecQwen3MultiModalProjector(nn.Module):
@@ -42,6 +52,7 @@ class CodecQwen3MultiModalProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
+
 
 class CodecQwen3CodecEmbedding(nn.Module):
     def __init__(self, config: CodecQwen3Config):
@@ -61,12 +72,17 @@ class CodecQwen3CodecEmbedding(nn.Module):
     def forward(self, codec_input_ids: torch.Tensor) -> torch.Tensor:
         codec_input_ids = codec_input_ids - self.config.codec_vocab_start
         embeds = self.codec_embed(codec_input_ids)
-        proj_embeds = torch.empty(codec_input_ids.shape + (self.config.hidden_size,), dtype=embeds.dtype, device=embeds.device)
+        proj_embeds = torch.empty(
+            codec_input_ids.shape + (self.config.hidden_size,),
+            dtype=embeds.dtype,
+            device=embeds.device,
+        )
         cb_size = self.config.codebook_size
         for i, codebook_proj in enumerate(self.codebook_projectors):
-            codebook_tokens = (codec_input_ids >= i*cb_size) & (codec_input_ids < (i+1)*cb_size)
+            codebook_tokens = (codec_input_ids >= i * cb_size) & (codec_input_ids < (i + 1) * cb_size)
             proj_embeds[codebook_tokens] = codebook_proj(embeds[codebook_tokens]).to(proj_embeds.dtype)
         return proj_embeds
+
 
 # Adapted from https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/qwen3/modeling_qwen3.py
 @auto_docstring
@@ -106,7 +122,11 @@ class CodecQwen3Model(Qwen3Model):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = torch.empty(input_ids.shape + (self.config.hidden_size,), dtype=self.dtype, device=self.device)
+            inputs_embeds = torch.empty(
+                input_ids.shape + (self.config.hidden_size,),
+                dtype=self.dtype,
+                device=self.device,
+            )
             vocab_tokens = input_ids < self.config.codec_vocab_start
             codec_tokens = input_ids >= self.config.codec_vocab_start
             inputs_embeds[vocab_tokens] = self.embed_tokens(input_ids[vocab_tokens])
@@ -172,11 +192,13 @@ class CodecQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def set_codec_embeddings(self, codec_embed_weight: torch.Tensor):
         assert (
-            codec_embed_weight.shape == self.model.embed_codec_tokens.codec_embed.weight.shape and
-            codec_embed_weight.dtype == self.model.embed_codec_tokens.codec_embed.weight.dtype
-        ), (f"codec_embed_weight must be a {self.model.embed_codec_tokens.codec_embed.weight.dtype} tensor "
-            f"of shape {self.model.embed_codec_tokens.codec_embed.weight.shape}")
-        
+            codec_embed_weight.shape == self.model.embed_codec_tokens.codec_embed.weight.shape
+            and codec_embed_weight.dtype == self.model.embed_codec_tokens.codec_embed.weight.dtype
+        ), (
+            f"codec_embed_weight must be a {self.model.embed_codec_tokens.codec_embed.weight.dtype} tensor "
+            f"of shape {self.model.embed_codec_tokens.codec_embed.weight.shape}"
+        )
+
         codec_embed_weight = codec_embed_weight.clone(memory_format=torch.contiguous_format).to(
             self.model.embed_codec_tokens.codec_embed.weight.device
         )
@@ -185,22 +207,23 @@ class CodecQwen3ForCausalLM(Qwen3ForCausalLM):
     def persist_codec_embeddings(self, batch_size: int = 1024, show_progress: bool = True):
         # first we have to untie the embeddings from the LM head if they are tied, otherwise
         # we end up lobotomizing the region of the LM head that corresponds to the codec tokens!
-        if getattr(self.config.get_text_config(decoder=True), "tie_word_embeddings"):
-            setattr(self.config.get_text_config(decoder=True), "tie_word_embeddings", False)
+        if self.config.get_text_config(decoder=True).tie_word_embeddings:
+            self.config.get_text_config(decoder=True).tie_word_embeddings = False
             self._tied_weights_keys = []
             self.lm_head.weight = torch.nn.Parameter(self.lm_head.weight.clone())
 
         # now, project each codebook vector and save it in self.embed_tokens
         num_embeddings = self.config.num_codebooks * self.config.codebook_size
         codec_input_ids = torch.arange(
-            self.config.codec_vocab_start, 
-            self.config.codec_vocab_start + num_embeddings, 
+            self.config.codec_vocab_start,
+            self.config.codec_vocab_start + num_embeddings,
             device=self.device,
             dtype=torch.long,
         )
         with torch.no_grad():
             if show_progress:
                 from tqdm import trange
+
                 range_iter = trange(0, num_embeddings, batch_size, desc="Persisting codec embeddings")
             else:
                 range_iter = range(0, num_embeddings, batch_size)
@@ -210,4 +233,6 @@ class CodecQwen3ForCausalLM(Qwen3ForCausalLM):
                 proj_embeds = self.model.embed_codec_tokens(batch_codec_input_ids)
                 self.model.embed_tokens.weight.data[batch_codec_input_ids] = proj_embeds
                 # sanity check
-                assert torch.equal(self.model.embed_tokens(batch_codec_input_ids), proj_embeds), "proj_embeds does not match embed_tokens"
+                assert torch.equal(self.model.embed_tokens(batch_codec_input_ids), proj_embeds), (
+                    "proj_embeds does not match embed_tokens"
+                )

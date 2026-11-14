@@ -51,9 +51,9 @@ import datasets
 import evaluate
 import numpy as np
 import torch
-from datasets import load_dataset
-
 import transformers
+from codec_bpe import UNICODE_OFFSET_LARGE
+from datasets import load_dataset
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -68,16 +68,21 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from realtime_speech_separation.codec_qwen3 import (
+    CodecQwen3Config,
+    CodecQwen3ForCausalLM,
+)
 from realtime_speech_separation.utils.training_utils import DataCollatorWithLossMasking
-from realtime_speech_separation.codec_qwen3 import CodecQwen3ForCausalLM, CodecQwen3Config
-from codec_bpe import UNICODE_OFFSET_LARGE
 
 # torch.set_float32_matmul_precision('high')
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.57.0.dev0")
 
-require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
+require_version(
+    "datasets>=2.14.0",
+    "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,7 @@ def get_model_and_config_class(model_name: str, use_codec_proj: bool):
             raise ValueError(f"Codec projection for {model_name} not supported.")
     else:
         return AutoModelForCausalLM, AutoConfig
+
 
 @dataclass
 class ModelArguments:
@@ -107,10 +113,12 @@ class ModelArguments:
         },
     )
     config_name: str | None = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+        default=None,
+        metadata={"help": "Pretrained config name or path if not the same as model_name"},
     )
     tokenizer_name: str | None = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+        default=None,
+        metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"},
     )
     cache_dir: str | None = field(
         default=None,
@@ -172,24 +180,18 @@ class ModelArguments:
     )
     end_header_token: str = field(
         default="<|end_header|>",
-        metadata={
-            "help": "The token indicating the end of the header in the input sequences."
-        },
+        metadata={"help": "The token indicating the end of the header in the input sequences."},
     )
     pad_vocab_to_multiple_of: int = field(
         default=8,
         metadata={
-            "help": (
-                "Pad the vocabulary size to be a multiple of this value. Useful for optimizing tensor cores."
-            )
+            "help": ("Pad the vocabulary size to be a multiple of this value. Useful for optimizing tensor cores.")
         },
     )
     cache_dataset_only: bool = field(
         default=False,
         metadata={
-            "help": (
-                "If set to True, the dataset will be cached but the training / validation will not be run."
-            )
+            "help": ("If set to True, the dataset will be cached but the training / validation will not be run.")
         },
     )
 
@@ -224,22 +226,20 @@ class DataTrainingArguments:
         },
     )
     overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+        default=False,
+        metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     preprocessing_num_workers: int | None = field(
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     keep_linebreaks: bool = field(
-        default=False, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
+        default=False,
+        metadata={"help": "Whether to keep line breaks when using TXT files or not."},
     )
     pad_sequences_to_multiple_of: int = field(
         default=8,
-        metadata={
-            "help": (
-                "Pad the sequences to be a multiple of this value. Useful for optimizing tensor cores."
-            )
-        },
+        metadata={"help": ("Pad the sequences to be a multiple of this value. Useful for optimizing tensor cores.")},
     )
 
     def __post_init__(self):
@@ -297,9 +297,7 @@ def main():
     if os.path.isdir(training_args.output_dir) and training_args.do_train:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty."
-            )
+            raise ValueError(f"Output directory ({training_args.output_dir}) already exists and is not empty.")
         elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change the `--output_dir`"
@@ -363,12 +361,14 @@ def main():
         assert codec_embed_weight.ndim == 3, (
             "codec_embed_file must contain a tensor of shape (num_codebooks, codebook_size, codebook_dim)"
         )
-        config_kwargs.update({
-            "num_codebooks": codec_embed_weight.shape[0],
-            "codebook_size": codec_embed_weight.shape[1],
-            "codebook_dim": codec_embed_weight.shape[2],
-            "tie_word_embeddings": False,
-        })
+        config_kwargs.update(
+            {
+                "num_codebooks": codec_embed_weight.shape[0],
+                "codebook_size": codec_embed_weight.shape[1],
+                "codebook_dim": codec_embed_weight.shape[2],
+                "tie_word_embeddings": False,
+            }
+        )
         # Flatten along the codebook axis to match the model embedding weight matrix shape
         codec_embed_weight = codec_embed_weight.view(-1, codec_embed_weight.shape[-1])
     if model_args.config_name:
@@ -376,9 +376,7 @@ def main():
     elif model_args.model_name_or_path:
         config = config_cls.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
-        raise ValueError(
-            "You must specify either --config_name or --model_name_or_path."
-        )
+        raise ValueError("You must specify either --config_name or --model_name_or_path.")
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -395,7 +393,9 @@ def main():
             # https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/modeling_utils.py -> _get_resized_embeddings
             new_vocab_size = ((len(tokenizer) + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
             pad_size = new_vocab_size - len(tokenizer)
-            logger.info(f"Updating `config.vocab_size` ({config.vocab_size}) to `len(tokenizer) + {pad_size}` ({new_vocab_size}).")
+            logger.info(
+                f"Updating `config.vocab_size` ({config.vocab_size}) to `len(tokenizer) + {pad_size}` ({new_vocab_size})."
+            )
             config.vocab_size = new_vocab_size
             config.bos_token_id = tokenizer.bos_token_id
             config.eos_token_id = tokenizer.eos_token_id
@@ -430,7 +430,11 @@ def main():
         else:
             model_kwargs = {} if dtype in ["auto", None] else {"dtype": dtype}
             if model_cls is AutoModelForCausalLM:
-                model = model_cls.from_config(config, trust_remote_code=model_args.trust_remote_code, **model_kwargs)
+                model = model_cls.from_config(
+                    config,
+                    trust_remote_code=model_args.trust_remote_code,
+                    **model_kwargs,
+                )
             else:
                 model = model_cls._from_config(config, **model_kwargs)
             n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
@@ -443,7 +447,7 @@ def main():
                 f"The tokenizer's vocabulary size ({len(tokenizer)}) is larger than the model's embedding size ({embedding_size}). "
                 "Please ensure that the model's embedding layer is correctly sized to accommodate the tokenizer's vocabulary."
             )
-        
+
         if codec_embed_weight is not None:
             model.set_codec_embeddings(codec_embed_weight.to(model.dtype))
             logger.info(
@@ -587,7 +591,10 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-generation"}
+    kwargs = {
+        "finetuned_from": model_args.model_name_or_path,
+        "tasks": "text-generation",
+    }
 
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)

@@ -106,7 +106,7 @@ For example, the target should be active in the separator output if-and-only-if 
 
 For this evaluation, we break the full reference and separated recordings into 100ms frames:
 ```python
-num_frames = math.ceil(reference.shape[-1] / int(0.1*sr))
+num_frames = math.ceil(reference.shape[-1] / int(0.1 * sr))
 ```
 For all Separated and Reference channels, we construct a boolean mask indicating speech activity in each 100ms frame.
 A frame is considered active if the majority of its span overlaps with VAD activity on the same channel.

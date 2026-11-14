@@ -1,6 +1,7 @@
 import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerFast
 
+
 class DataCollatorWithLossMasking(DataCollatorWithPadding):
     def __init__(self, tokenizer: PreTrainedTokenizerFast, end_header_token: str, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
@@ -19,7 +20,9 @@ class DataCollatorWithLossMasking(DataCollatorWithPadding):
         # - All the M tokens from the audio code triples after the <|end_header|> token e.g. M1 L1 R1 M2 L2 R2 ...
         is_end_header = input_ids == self.end_header_token_id
         body_start = is_end_header.byte().argmax(dim=1) + 1  # first occurrence per row
-        body_start_offset = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0) - body_start.unsqueeze(1)
+        body_start_offset = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(
+            0
+        ) - body_start.unsqueeze(1)
 
         header_mask = body_start_offset < 0
         special_token_mask = torch.isin(input_ids, self.special_token_ids)

@@ -1,16 +1,16 @@
-from typing import Optional, Union, Iterator, List, Tuple, Dict
-from tqdm import tqdm
-import numpy as np
 import itertools
-import re
-import random
-import os
 import json
+import os
+import random
+import re
+from collections.abc import Iterator
 
-from codec_bpe import codes_to_chars, UNICODE_OFFSET_LARGE
+import numpy as np
+from codec_bpe import UNICODE_OFFSET_LARGE, codes_to_chars
 from codec_bpe.core.utils import get_codes_files
+from tqdm import tqdm
 
-DELAY_TOKENS: List[str] = [
+DELAY_TOKENS: list[str] = [
     "<|delay_0ms|>",
     "<|delay_100ms|>",
     "<|delay_200ms|>",
@@ -21,13 +21,14 @@ DELAY_TOKENS: List[str] = [
     "<|delay_6400ms|>",
 ]
 
+
 class LMDatasetBuilder:
     def __init__(
         self,
         num_codebooks: int,
         codebook_size: int,
         codec_framerate: float,
-        header_delay_tokens: List[str] = DELAY_TOKENS,
+        header_delay_tokens: list[str] = DELAY_TOKENS,
         header_target_voice_token: str = "<|target_voice|>",
         header_end_token: str = "<|end_header|>",
         skip_char: str = "-",
@@ -39,8 +40,8 @@ class LMDatasetBuilder:
         voice_enrollment_hard_min_secs: float = 2.0,
         voice_enrollment_vad_merge_secs: float = 1.0,
         voice_enrollment_ideal_min_candidates: int = 10,
-        voice_enrollment_selection_seed: int = 42 ** 2,
-        delay_selection_seed: int = 42 ** 3,
+        voice_enrollment_selection_seed: int = 42**2,
+        delay_selection_seed: int = 42**3,
     ):
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
@@ -80,14 +81,14 @@ class LMDatasetBuilder:
         self.voice_enroll_rng_gen = random.Random(self.voice_enrollment_selection_seed)
         self.delay_rng_gen = random.Random(self.delay_selection_seed)
 
-    def _load_vad(self, vad_path: str) -> List[Dict[str, float]]:
+    def _load_vad(self, vad_path: str) -> list[dict[str, float]]:
         try:
-            with open(vad_path, "r") as f:
+            with open(vad_path) as f:
                 return json.load(f)
         except Exception as e:
-            raise ValueError(f"Failed to load VAD file {vad_path}: {e}")
+            raise ValueError(f"Failed to load VAD file {vad_path}: {e}") from e
 
-    def _group_codes_files(self, codes_path: str, codes_files: List[str]) -> List[Tuple[str, List[List[str]]]]:
+    def _group_codes_files(self, codes_path: str, codes_files: list[str]) -> list[tuple[str, list[list[str]]]]:
         grouped_codes_files = []
         last_file_root = None
         for codes_file in codes_files:
@@ -110,7 +111,7 @@ class LMDatasetBuilder:
             num_channels = max([channel for _, channel in file_group]) + 1
             channel_grouped_codes_files.append(
                 (
-                    file_root, 
+                    file_root,
                     [[f[0] for f in file_group if f[1] == c] for c in range(num_channels)],
                 )
             )
@@ -118,11 +119,11 @@ class LMDatasetBuilder:
         return channel_grouped_codes_files
 
     def _filter_and_group_codes_files(
-        self, 
+        self,
         codes_path: str,
-        codes_filter: Optional[Union[str, List[str]]] = None,
-        codes_filter_exclude: Optional[Union[str, List[str]]] = None,
-    ) -> List[Tuple[str, List[List[str]]]]:
+        codes_filter: str | list[str] | None = None,
+        codes_filter_exclude: str | list[str] | None = None,
+    ) -> list[tuple[str, list[list[str]]]]:
         # get the codes files
         codes_files = get_codes_files(codes_path, codes_filter)
         if codes_filter_exclude:
@@ -134,37 +135,35 @@ class LMDatasetBuilder:
         return grouped_codes_files
 
     def _merge_grouped_codes_files(
-        self, 
-        grouped_codes_files_mono: List[Tuple[str, List[List[str]]]],
-        grouped_codes_files_stereo: List[Tuple[str, List[List[str]]]],
-    ) -> List[Tuple[str, List[List[str]]]]:
+        self,
+        grouped_codes_files_mono: list[tuple[str, list[list[str]]]],
+        grouped_codes_files_stereo: list[tuple[str, list[list[str]]]],
+    ) -> list[tuple[str, list[list[str]]]]:
         grouped_codes_files = []
         mono_dict = dict(grouped_codes_files_mono)
         for file_root, stereo_channels in grouped_codes_files_stereo:
             if file_root in mono_dict:
-                grouped_codes_files.append(
-                    (file_root, mono_dict[file_root] + stereo_channels)
-                )
+                grouped_codes_files.append((file_root, mono_dict[file_root] + stereo_channels))
             else:
                 print(f"{file_root} is in stereo but not in mono. Skipping file...")
         return grouped_codes_files
 
     def _build_example_codes_str(
-        self, 
-        channels_chars: List[str], 
+        self,
+        channels_chars: list[str],
         example_start_code: int,
         example_end_code: int,
         target_channel: int,
         delay_codes: int,
     ) -> str:
         # sanity check: example must be longer than the delay
-        if example_end_code-example_start_code <= delay_codes:
+        if example_end_code - example_start_code <= delay_codes:
             raise ValueError(
                 "Example length must be greater than the delay. This should have never happened - "
                 "something went wrong in the main loop that slices the example ranges."
             )
         # sanity check: we have at least `delay_codes` available future codes
-        if example_end_code+delay_codes > len(channels_chars[0]):
+        if example_end_code + delay_codes > len(channels_chars[0]):
             raise ValueError(
                 "Not enough future codes available for the specified delay. This should have never happened - "
                 "something went wrong in the main loop that slices the example ranges."
@@ -172,14 +171,14 @@ class LMDatasetBuilder:
 
         # slice codes from the full sequence for the current example
         example_channels_chars = [ch[example_start_code:example_end_code] for ch in channels_chars]
-        # if we are under a delay condition, shift the channels so that each pair of stereo codes correspond to 
+        # if we are under a delay condition, shift the channels so that each pair of stereo codes correspond to
         # the mono code from `delay_secs` seconds ago
         if delay_codes > 0:
             # Append `delay_codes` worth of future codes beyond `example_end_code` to the end of the mono channel, and
             # pad the beginning of the stereo channels with `delay_codes` worth of skip chars.
             # The end result has the mono inputs starting at `example_start_code` and the stereo outputs ending at `example_end_code`,
             # while maintaining the delayed alignment between mono and stereo channels.
-            future_codes = channels_chars[0][example_end_code:example_end_code+delay_codes]
+            future_codes = channels_chars[0][example_end_code : example_end_code + delay_codes]
             example_channels_chars[0] += future_codes
             for i in range(1, len(example_channels_chars)):
                 example_channels_chars[i] = self.skip_char * delay_codes + example_channels_chars[i]
@@ -189,14 +188,14 @@ class LMDatasetBuilder:
             example_channels_chars = example_channels_chars[:1] + example_channels_chars[1:][::-1]
 
         # compile the codes string by interleaving the channels as M L R M L R ...
-        codes_str = "".join(list(itertools.chain.from_iterable(zip(*example_channels_chars))))
+        codes_str = "".join(list(itertools.chain.from_iterable(zip(*example_channels_chars, strict=False))))
         return codes_str
 
     def _preprocess_vad_for_target_voice_selection(
-        self, 
-        vad_data: List[Dict[str, float]], 
+        self,
+        vad_data: list[dict[str, float]],
         target_channel_chars: str,
-    ) -> List[Tuple[int, int, float, str]]:
+    ) -> list[tuple[int, int, float, str]]:
         # Merge consecutive VAD segments that are closer than `voice_enrollment_vad_merge_secs`
         merged_vad_data = []
         for segment in vad_data:
@@ -228,7 +227,12 @@ class LMDatasetBuilder:
         # filter out speech ranges that are shorter than `voice_enrollment_hard_min_secs`
         # and extract the corresponding speech characters from the target channel
         speech_ranges = [
-            (start_code, end_code, length_secs, target_channel_chars[start_code:end_code]) 
+            (
+                start_code,
+                end_code,
+                length_secs,
+                target_channel_chars[start_code:end_code],
+            )
             for start_code, end_code, length_secs in speech_ranges
             if length_secs >= self.voice_enrollment_hard_min_secs
         ]
@@ -240,19 +244,21 @@ class LMDatasetBuilder:
 
     def _select_target_voice(
         self,
-        target_channel_speech_ranges: List[Tuple[int, int, float, str]],
+        target_channel_speech_ranges: list[tuple[int, int, float, str]],
         example_start_code: int,
         example_end_code: int,
-    ) -> Optional[Tuple[int, int, str]]:
+    ) -> tuple[int, int, str] | None:
         # only sample from speech segments outside the current example range.
         target_channel_speech_ranges = [
-            (start_code, end_code, length_secs, voice_str) for start_code, end_code, length_secs, voice_str in target_channel_speech_ranges 
-            if (end_code <= example_start_code or start_code >= example_end_code) # outside the current example range
+            (start_code, end_code, length_secs, voice_str)
+            for start_code, end_code, length_secs, voice_str in target_channel_speech_ranges
+            if (end_code <= example_start_code or start_code >= example_end_code)  # outside the current example range
         ]
         # take `voice_enrollment_ideal_min_candidates` longest candidates or all that are
         # `voice_enrollment_ideal_min_secs` and longer, whichever yields more candidates.
         voice_candidates = [
-            (start_code, end_code, voice_str) for i, (start_code, end_code, length_secs, voice_str) in enumerate(target_channel_speech_ranges) 
+            (start_code, end_code, voice_str)
+            for i, (start_code, end_code, length_secs, voice_str) in enumerate(target_channel_speech_ranges)
             if i < self.voice_enrollment_ideal_min_candidates or length_secs >= self.voice_enrollment_ideal_min_secs
         ]
         # Select a random voice candidate from voice_candidates
@@ -262,17 +268,21 @@ class LMDatasetBuilder:
         return selected_voice
 
     def iterate_examples(
-        self, 
+        self,
         codes_path: str,
         vads_path: str,
-        codes_filter: Optional[Union[str, List[str]]] = None,
-        codes_filter_exclude: Optional[Union[str, List[str]]] = None,
+        codes_filter: str | list[str] | None = None,
+        codes_filter_exclude: str | list[str] | None = None,
     ) -> Iterator[str]:
         self.delay_rng_gen.seed(self.delay_selection_seed)
 
         # get the mono and stereo codes files
-        grouped_codes_files_mono = self._filter_and_group_codes_files(os.path.join(codes_path, "mono"), codes_filter, codes_filter_exclude)
-        grouped_codes_files_stereo = self._filter_and_group_codes_files(os.path.join(codes_path, "stereo"), codes_filter, codes_filter_exclude)
+        grouped_codes_files_mono = self._filter_and_group_codes_files(
+            os.path.join(codes_path, "mono"), codes_filter, codes_filter_exclude
+        )
+        grouped_codes_files_stereo = self._filter_and_group_codes_files(
+            os.path.join(codes_path, "stereo"), codes_filter, codes_filter_exclude
+        )
         # merge channels: mono first, then the two stereo channels. Drop any file roots that are not in both mono and stereo lists
         grouped_codes_files = self._merge_grouped_codes_files(grouped_codes_files_mono, grouped_codes_files_stereo)
 
@@ -280,38 +290,38 @@ class LMDatasetBuilder:
         grouped_codes_files_verified = []
         for file_root, file_channels in grouped_codes_files:
             if len(file_channels) != 3:
-                print(f"Expected 3 channels (1 mono + 2 stereo) for {file_root}, but got {len(file_channels)}. Skipping file...")
+                print(
+                    f"Expected 3 channels (1 mono + 2 stereo) for {file_root}, but got {len(file_channels)}. Skipping file..."
+                )
             else:
                 grouped_codes_files_verified.append((file_root, file_channels))
-        
+
         # iterate over each group of codes files
         for file_root, file_channels in tqdm(grouped_codes_files_verified, desc="Codes file groups"):
-            # reseed the voice enrollment random number generator for each file root, this way we get the same 
+            # reseed the voice enrollment random number generator for each file root, this way we get the same
             # voice enrollment selections per file even if the number/order of files in the dataset changes.
             self.voice_enroll_rng_gen.seed(self.voice_enrollment_selection_seed)
 
             # concatenate all codes files in each group for each channel
             codes = np.stack(
-                [
-                    np.concatenate([np.load(file) for file in file_group], axis=-1) 
-                    for file_group in file_channels
-                ], 
+                [np.concatenate([np.load(file) for file in file_group], axis=-1) for file_group in file_channels],
                 axis=0,
             )
             if len(codes.shape) == 5:
                 codes = codes[:, 0, 0]
             elif len(codes.shape) == 4:
                 codes = codes[:, 0]
-            codes = codes[:, :self.num_codebooks] # shape: (num_channels, num_codebooks, sequence_length)
+            codes = codes[:, : self.num_codebooks]  # shape: (num_channels, num_codebooks, sequence_length)
 
             # convert codes to unicode string
             channels_chars = [
                 codes_to_chars(
-                    ch_codes, 
-                    self.codebook_size, 
+                    ch_codes,
+                    self.codebook_size,
                     copy_before_conversion=False,
                     unicode_offset=self.unicode_offset,
-                ) for ch_codes in codes
+                )
+                for ch_codes in codes
             ]
 
             # If this is a "one-vs-all" sample where channel 0 has the target speaker and channel 1 has multiple mixed other speakers,
@@ -326,7 +336,9 @@ class LMDatasetBuilder:
                 target_channel_vad_file = os.path.join(vads_path, f"{file_root}_c{target_channel}.json")
                 target_channel_vad = self._load_vad(target_channel_vad_file)
                 target_channel_chars = channels_chars[1 + target_channel]
-                target_channel_speech_ranges = self._preprocess_vad_for_target_voice_selection(target_channel_vad, target_channel_chars)
+                target_channel_speech_ranges = self._preprocess_vad_for_target_voice_selection(
+                    target_channel_vad, target_channel_chars
+                )
                 if not target_channel_speech_ranges:
                     print(
                         f"No speech ranges longer than {self.voice_enrollment_hard_min_secs} seconds found for "
@@ -341,8 +353,11 @@ class LMDatasetBuilder:
                     delay_token = self.delay_rng_gen.choice(self.header_delay_tokens)
                     delay_secs, delay_codes = self.delay_info[delay_token]
 
-                    end_code = min(start_code + self.context_codes, len(channels_chars[0])-delay_codes)
-                    if end_code-start_code <= delay_codes:
+                    end_code = min(
+                        start_code + self.context_codes,
+                        len(channels_chars[0]) - delay_codes,
+                    )
+                    if end_code - start_code <= delay_codes:
                         print(
                             f"Example in range {start_code}-{end_code} for target channel {target_channel} "
                             f"in file {file_root} is too short for delay {delay_secs}. Skipping last example..."
@@ -350,10 +365,12 @@ class LMDatasetBuilder:
                         break
 
                     # select the target voice for the current example
-                    target_voice = self._select_target_voice(target_channel_speech_ranges, start_code, end_code+delay_codes)
+                    target_voice = self._select_target_voice(
+                        target_channel_speech_ranges, start_code, end_code + delay_codes
+                    )
                     if target_voice is None:
                         print(
-                            f"Could not find target voice sample outside of range {start_code}-{end_code+delay_codes} "
+                            f"Could not find target voice sample outside of range {start_code}-{end_code + delay_codes} "
                             f"on channel {target_channel} for delay {delay_secs} in file {file_root}. Skipping example..."
                         )
                     else:
@@ -369,12 +386,20 @@ class LMDatasetBuilder:
                             "tv_start_secs": tv_start_code / (self.codec_framerate * self.num_codebooks),
                             "tv_end_secs": tv_end_code / (self.codec_framerate * self.num_codebooks),
                         }
-                        example = self._build_example_codes_str(channels_chars, start_code, end_code, target_channel, delay_codes)
-                        example = f"{delay_token}{self.header_target_voice_token}{tv_str}{self.header_end_token}{example}"
+                        example = self._build_example_codes_str(
+                            channels_chars,
+                            start_code,
+                            end_code,
+                            target_channel,
+                            delay_codes,
+                        )
+                        example = (
+                            f"{delay_token}{self.header_target_voice_token}{tv_str}{self.header_end_token}{example}"
+                        )
                         yield example, metadata
                         example_index += 1
 
                     # move to next start_code, or break if we've reached the end of the sequence
-                    if end_code >= len(channels_chars[0])-delay_codes:
+                    if end_code >= len(channels_chars[0]) - delay_codes:
                         break
                     start_code = end_code - self.overlap_codes

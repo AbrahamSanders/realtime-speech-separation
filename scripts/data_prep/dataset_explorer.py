@@ -1,23 +1,27 @@
 import json
 import os
-import torch
 from collections import OrderedDict
 from glob import glob
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 import streamlit as st
+import torch
 
 from realtime_speech_separation import AudioTokenizer
-from realtime_speech_separation.utils.audio_utils import smooth_join, create_crossfade_ramps
+from realtime_speech_separation.utils.audio_utils import (
+    create_crossfade_ramps,
+    smooth_join,
+)
 from realtime_speech_separation.utils.data_utils import try_load_original_audio
 
 DEFAULT_OUTPUT_DIR = "output"
 METADATA_SUFFIX = "_metadata.jsonl"
 DEFAULT_RAW_AUDIO_DIR = "data/audio/raw"
 
+
 @st.cache_resource()
-def get_audio_tokenizers() -> Tuple[AudioTokenizer, AudioTokenizer]:
+def get_audio_tokenizers() -> tuple[AudioTokenizer, AudioTokenizer]:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     mono_tokenizer = AudioTokenizer(device=device)
     stereo_tokenizer = AudioTokenizer(codec_model=mono_tokenizer.codec_model, num_channels=2, device=device)
@@ -25,7 +29,7 @@ def get_audio_tokenizers() -> Tuple[AudioTokenizer, AudioTokenizer]:
 
 
 @st.cache_resource(show_spinner=False)
-def load_metadata(metadata_path: str) -> Tuple[OrderedDict, List[Dict[str, Any]]]:
+def load_metadata(metadata_path: str) -> tuple[OrderedDict, list[dict[str, Any]]]:
     """Load the metadata jsonl.
 
     Returns (index, records) where records holds each line's metadata exactly as it
@@ -33,9 +37,9 @@ def load_metadata(metadata_path: str) -> Tuple[OrderedDict, List[Dict[str, Any]]
         file_id -> target_channel -> [line indices into records / the dataset txt file]
     Each line of the metadata jsonl corresponds 1:1 to the same line of the txt file.
     """
-    index: OrderedDict[str, OrderedDict[int, List[int]]] = OrderedDict()
-    records: List[Dict[str, Any]] = []
-    with open(metadata_path, "r", encoding="utf-8") as f:
+    index: OrderedDict[str, OrderedDict[int, list[int]]] = OrderedDict()
+    records: list[dict[str, Any]] = []
+    with open(metadata_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -96,31 +100,42 @@ def read_example(txt_path: str, offsets: np.ndarray, line_idx: int) -> str:
 def render_audio(
     audio_str: str,
     audio_tokenizer: AudioTokenizer,
-    crossfade_ramps: Tuple[np.ndarray, np.ndarray],
+    crossfade_ramps: tuple[np.ndarray, np.ndarray],
     decoding_chunk_size_secs: float,
-    length_secs: float
+    length_secs: float,
 ):
     audio_tokenizer.reset_context()
     # stream-decode the reconstruction
     chunk_size_frames = int(decoding_chunk_size_secs * audio_tokenizer.framerate * audio_tokenizer.num_channels)
-    decode_frames = min(int(length_secs * audio_tokenizer.framerate * audio_tokenizer.num_channels), len(audio_str)) if length_secs > 0 else len(audio_str)
+    decode_frames = (
+        min(
+            int(length_secs * audio_tokenizer.framerate * audio_tokenizer.num_channels),
+            len(audio_str),
+        )
+        if length_secs > 0
+        else len(audio_str)
+    )
     audio = np.zeros((audio_tokenizer.num_channels, 0), dtype=np.float32)
     for start in range(0, decode_frames, chunk_size_frames):
         end = start + chunk_size_frames
         chunk = audio_str[start:end]
         (_, output_audio), _, _ = audio_tokenizer.detokenize_audio(chunk, preroll_samples=crossfade_ramps[0])
-        audio = smooth_join(audio, output_audio.reshape(audio_tokenizer.num_channels, -1), *crossfade_ramps)
+        audio = smooth_join(
+            audio,
+            output_audio.reshape(audio_tokenizer.num_channels, -1),
+            *crossfade_ramps,
+        )
     return audio
 
+
 def render_example(
-    example: str, 
+    example: str,
     chunk_size_secs: float,
     length_secs: float,
-    metadata: Dict,
+    metadata: dict,
     raw_audio_dir: str,
 ) -> None:
-    """Decode and render the media for a single dataset example.
-    """
+    """Decode and render the media for a single dataset example."""
     header_end_token = "<|end_header|>"
     target_voice_token = "<|target_voice|>"
     st.caption(f"{len(example):,} characters")
@@ -136,21 +151,18 @@ def render_example(
     if target_voice is None:
         st.warning("No target voice found in the header.")
         return
-    st.caption(
-        f"target voice: {len(target_voice):,} chars · "
-        f"body: {len(body):,} chars"
-    )
+    st.caption(f"target voice: {len(target_voice):,} chars · body: {len(body):,} chars")
 
     # render all example audio strs (target voice, mono, stereo)
     mono_str = body[0::3]
-    stereo_str = "".join(a + b for a, b in zip(body[1::3], body[2::3]))
+    stereo_str = "".join(a + b for a, b in zip(body[1::3], body[2::3], strict=False))
     # if there is a delay in the example, the mono_str will be padded at the end with D future codes and the stereo_str will
     # be padded at the beginning with 2D that number of skip chars (D per channel).
     # In order to properly render the audio, we need to remove the delay padding from all channels.
     delay_codes = (stereo_str.rfind("-") + 1) // 2
     if delay_codes > 0:
         mono_str = mono_str[:-delay_codes]
-        stereo_str = stereo_str[2 * delay_codes:]
+        stereo_str = stereo_str[2 * delay_codes :]
 
     mono_tokenizer, stereo_tokenizer = get_audio_tokenizers()
     crossfade_ramps = create_crossfade_ramps(mono_tokenizer.sampling_rate, fade_secs=0.02)
@@ -190,7 +202,9 @@ def render_example(
     target_secs = target_voice_audio.shape[-1] / mono_tokenizer.sampling_rate
     mono_secs = mono_audio.shape[-1] / mono_tokenizer.sampling_rate
     stereo_secs = stereo_audio.shape[-1] / stereo_tokenizer.sampling_rate
-    decoded_audio_header.write(f"Decoded Audio: target voice ({target_secs:.2f} s) / mono ({mono_secs:.2f} s) / stereo ({stereo_secs:.2f} s):")
+    decoded_audio_header.write(
+        f"Decoded Audio: target voice ({target_secs:.2f} s) / mono ({mono_secs:.2f} s) / stereo ({stereo_secs:.2f} s):"
+    )
 
     # load all original audios corresponding to this example for comparison (target voice, mono, stereo)
     original_audio_header = st.empty()
@@ -208,9 +222,12 @@ def render_example(
         target_secs = tv_audio.shape[-1] / sr
         mono_secs = ex_audio_mono.shape[-1] / sr
         stereo_secs = ex_audio_stereo.shape[-1] / sr
-        original_audio_header.write(f"Original Audio: target voice ({target_secs:.2f} s) / mono ({mono_secs:.2f} s) / stereo ({stereo_secs:.2f} s):")
+        original_audio_header.write(
+            f"Original Audio: target voice ({target_secs:.2f} s) / mono ({mono_secs:.2f} s) / stereo ({stereo_secs:.2f} s):"
+        )
 
-def format_time_spans(metadata: Dict[str, Any]) -> str:
+
+def format_time_spans(metadata: dict[str, Any]) -> str:
     """One-line summary of the time spans in the metadata, for whichever are present."""
     spans = [
         ("example", "ex_start_secs", "ex_end_secs"),
@@ -227,7 +244,7 @@ def format_time_spans(metadata: Dict[str, Any]) -> str:
     return " \u00b7 ".join(parts)
 
 
-def find_metadata_files(output_dir: str) -> List[str]:
+def find_metadata_files(output_dir: str) -> list[str]:
     return sorted(glob(os.path.join(output_dir, f"*{METADATA_SUFFIX}")))
 
 
@@ -235,6 +252,7 @@ def set_position(file_i: int, channel_i: int, example_i: int) -> None:
     st.session_state.file_i = file_i
     st.session_state.channel_i = channel_i
     st.session_state.example_i = example_i
+
 
 def main() -> None:
     st.set_page_config(page_title="Dataset Explorer", layout="wide")
@@ -323,7 +341,7 @@ def main() -> None:
         ),
     ]
     for group_col, (name, prev_args, prev_disabled, next_args, next_disabled) in zip(
-        st.columns(3), nav_groups
+        st.columns(3), nav_groups, strict=False
     ):
         prev_col, next_col = group_col.columns(2)
         prev_col.button(
@@ -368,7 +386,13 @@ def main() -> None:
 
         st.header("Decoding Settings")
         chunk_size_secs = st.slider("Chunk size (seconds)", min_value=0.02, max_value=1.0, value=1.0, step=0.02)
-        length_secs = st.slider("Length (seconds): zero for full length", min_value=0, max_value=300, value=0, step=1)
+        length_secs = st.slider(
+            "Length (seconds): zero for full length",
+            min_value=0,
+            max_value=300,
+            value=0,
+            step=1,
+        )
 
     # current example
     st.subheader(file_id)
@@ -393,7 +417,7 @@ def main() -> None:
         length_secs=length_secs,
         metadata=metadata,
         raw_audio_dir=raw_audio_dir,
-    )            
+    )
 
     with st.expander("Raw metadata"):
         st.json(metadata)

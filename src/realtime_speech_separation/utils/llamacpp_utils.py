@@ -1,7 +1,9 @@
-from llama_cpp import Llama, LogitsProcessorList, StoppingCriteriaList, LlamaGrammar
-from typing import Sequence, Optional, Generator
-import sys
 import ctypes
+import sys
+from collections.abc import Generator, Sequence
+
+from llama_cpp import Llama, LlamaGrammar, LogitsProcessorList, StoppingCriteriaList
+
 
 class LlamaForAlternatingCodeChannels(Llama):
     def __init__(self, *args, **kwargs):
@@ -11,7 +13,7 @@ class LlamaForAlternatingCodeChannels(Llama):
         self.reset()
         self.eval(ctx_input_ids)
         self.eval(input_ids)
-        logits = self._scores[-len(input_ids)-1:-1]
+        logits = self._scores[-len(input_ids) - 1 : -1]
         logprobs = Llama.logits_to_logprobs(logits)
         logprobs = logprobs[range(len(input_ids)), input_ids]
         return logprobs
@@ -31,9 +33,9 @@ class LlamaForAlternatingCodeChannels(Llama):
         mirostat_tau: float = 5.0,
         mirostat_eta: float = 0.1,
         penalize_nl: bool = True,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        grammar: Optional[LlamaGrammar] = None,
-        seed: Optional[int] = None,
+        logits_processor: LogitsProcessorList | None = None,
+        grammar: LlamaGrammar | None = None,
+        seed: int | None = None,
     ) -> None:
         self.set_seed(seed if seed is not None else -1)
         # Reset mirostat sampling
@@ -58,7 +60,7 @@ class LlamaForAlternatingCodeChannels(Llama):
 
     def sample(
         self,
-        idx: Optional[int] = None,
+        idx: int | None = None,
     ):
         """Sample a token from the model.
 
@@ -78,8 +80,8 @@ class LlamaForAlternatingCodeChannels(Llama):
         self,
         tokens: Sequence[int],
         reset: bool = True,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-    ) -> Generator[int, Optional[Sequence[int]], None]:
+        stopping_criteria: StoppingCriteriaList | None = None,
+    ) -> Generator[int, Sequence[int] | None, None]:
         """Create a generator of tokens from a prompt.
 
         Examples:
@@ -98,7 +100,7 @@ class LlamaForAlternatingCodeChannels(Llama):
         # Check for kv cache prefix match
         if reset and self.n_tokens > 0:
             longest_prefix = 0
-            for a, b in zip(self._input_ids, tokens[:-1]):
+            for a, b in zip(self._input_ids, tokens[:-1], strict=False):
                 if a == b:
                     longest_prefix += 1
                 else:
@@ -135,7 +137,8 @@ class LlamaForAlternatingCodeChannels(Llama):
 
                 sample_idx += 1
                 if stopping_criteria is not None and stopping_criteria(
-                    self._input_ids[: sample_idx], self._scores[sample_idx - self.n_tokens, :]
+                    self._input_ids[:sample_idx],
+                    self._scores[sample_idx - self.n_tokens, :],
                 ):
                     return
                 tokens_or_none = yield token
@@ -151,11 +154,5 @@ class LlamaForAlternatingCodeChannels(Llama):
 
             if self.draft_model is not None:
                 self.input_ids[self.n_tokens : self.n_tokens + len(tokens)] = tokens
-                draft_tokens = self.draft_model(
-                    self.input_ids[: self.n_tokens + len(tokens)]
-                )
-                tokens.extend(
-                    draft_tokens.astype(int)[
-                        : self._n_ctx - self.n_tokens - len(tokens)
-                    ]
-                )
+                draft_tokens = self.draft_model(self.input_ids[: self.n_tokens + len(tokens)])
+                tokens.extend(draft_tokens.astype(int)[: self._n_ctx - self.n_tokens - len(tokens)])

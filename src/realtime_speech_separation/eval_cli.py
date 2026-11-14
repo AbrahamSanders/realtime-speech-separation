@@ -1,29 +1,32 @@
-from typing import List, Dict
+import argparse
+import json
+import logging
+import os
+
+import librosa
 import numpy as np
 import pandas as pd
-import argparse
-import logging
-import librosa
-import os
-import json
-from tqdm import tqdm
 from asteroid.metrics import get_metrics
+from tqdm import tqdm
 
 from .utils.data_utils import get_audio_files
 
 logger = logging.getLogger(__name__)
 
+
 def get_enrollment_file(input_file: str) -> str:
     file_name, ext = os.path.splitext(input_file)
     return f"{file_name}_enrollment{ext}"
+
 
 def get_reference_file(input_file: str) -> str:
     file_name, ext = os.path.splitext(input_file)
     return f"{file_name}_reference{ext}"
 
-def get_separated_files(input_file: str) -> List[str]:
+
+def get_separated_files(input_file: str) -> list[str]:
     # For input file "1.wav", separated files will be like "1_separated_<inference_args_hash>.wav".
-    # There may be multiple separated files for a single input file. Also, separated files may 
+    # There may be multiple separated files for a single input file. Also, separated files may
     # use a different extension than the input file.
     file_base, _ = os.path.splitext(input_file)
     file_base = os.path.basename(file_base)
@@ -33,26 +36,30 @@ def get_separated_files(input_file: str) -> List[str]:
             separated_files.append(os.path.join(os.path.dirname(input_file), f))
     return separated_files
 
+
 def get_results_file(separated_file: str) -> str:
     file_name, _ = os.path.splitext(separated_file)
     return file_name.replace("_separated_", "_results_") + ".json"
 
-def read_results_if_exist(separated_file: str) -> Dict:
+
+def read_results_if_exist(separated_file: str) -> dict:
     results_file = get_results_file(separated_file)
     if os.path.exists(results_file):
-        with open(results_file, "r") as f:
+        with open(results_file) as f:
             return json.load(f)
     return {}
 
-def write_results(separated_file: str, results: Dict):
+
+def write_results(separated_file: str, results: dict):
     results_file = get_results_file(separated_file)
     with open(results_file, "w") as f:
         json.dump(results, f, indent=4)
 
+
 def run_eval(args: argparse.Namespace) -> None:
     input_files = get_audio_files(
-        args.input_dir, 
-        filter_include=args.input_filter, 
+        args.input_dir,
+        filter_include=args.input_filter,
         filter_exclude=["_enrollment.", "_separated_", "_reference."],
     )
 
@@ -66,14 +73,26 @@ def run_eval(args: argparse.Namespace) -> None:
             # Check if results already exist for this separation and load them if available. Otherwise proceed to compute the metrics
             results = read_results_if_exist(sep_file)
             if results and not args.overwrite:
-                logger.info(f"Found results for separation {inference_args_hash} of input audio {input_file}. Skipping.")
+                logger.info(
+                    f"Found results for separation {inference_args_hash} of input audio {input_file}. Skipping."
+                )
             else:
                 logger.info(f"Processing separation {inference_args_hash} of input audio {input_file}.")
 
                 # Load the input, enrollment, reference, and separated audio files
                 input_audio, _ = librosa.load(input_file, sr=args.sample_rate, mono=True, dtype=np.float32)
-                enrollment_audio, _ = librosa.load(get_enrollment_file(input_file), sr=args.sample_rate, mono=True, dtype=np.float32)
-                reference_audio, _ = librosa.load(get_reference_file(input_file), sr=args.sample_rate, mono=False, dtype=np.float32)
+                enrollment_audio, _ = librosa.load(
+                    get_enrollment_file(input_file),
+                    sr=args.sample_rate,
+                    mono=True,
+                    dtype=np.float32,
+                )
+                reference_audio, _ = librosa.load(
+                    get_reference_file(input_file),
+                    sr=args.sample_rate,
+                    mono=False,
+                    dtype=np.float32,
+                )
                 separated_audio, _ = librosa.load(sep_file, sr=args.sample_rate, mono=False, dtype=np.float32)
 
                 # Compute and write the evaluation metrics for the separated audio
@@ -113,7 +132,11 @@ def run_eval(args: argparse.Namespace) -> None:
         results_summary = {}
 
         # Filter out results that contain None values to avoid errors during aggregation
-        filtered_results_list = [(sep_file, results) for sep_file, results in results_list if not any(value is None for value in results.values())]
+        filtered_results_list = [
+            (sep_file, results)
+            for sep_file, results in results_list
+            if not any(value is None for value in results.values())
+        ]
 
         # Compute the mean, sd and 5-number summary of each metric across all filtered results
         for key in filtered_results_list[0][1]:
@@ -152,23 +175,48 @@ def run_eval(args: argparse.Namespace) -> None:
         df = pd.DataFrame(csv_rows)
         df.to_csv(csv_filename, index=False)
 
+
 def main(argv: list[str] | None = None) -> int:
     """Run the Speech Separation Evaluation."""
 
     parser = argparse.ArgumentParser(description=__doc__)
 
     input_group = parser.add_argument_group("Input Arguments")
-    input_group.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing input/enrollment/reference/separated pairs.")
+    input_group.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Path to the input directory containing input/enrollment/reference/separated pairs.",
+    )
     input_group.add_argument("--input_filter", type=str, nargs="+", help="Filter for input files.")
-    input_group.add_argument("--sample_rate", type=int, default=16000, help="Sample rate to use when loading audio files.")
-    input_group.add_argument("--compute_permutation", action="store_true", help="Whether to compute the optimal permutation for separated sources.")
+    input_group.add_argument(
+        "--sample_rate",
+        type=int,
+        default=16000,
+        help="Sample rate to use when loading audio files.",
+    )
+    input_group.add_argument(
+        "--compute_permutation",
+        action="store_true",
+        help="Whether to compute the optimal permutation for separated sources.",
+    )
 
     output_group = parser.add_argument_group("Output Arguments")
-    output_group.add_argument("--overwrite", action="store_true", help="Overwrite existing results files (summaries are always recomputed).")
+    output_group.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing results files (summaries are always recomputed).",
+    )
 
     logging_group = parser.add_argument_group("Logging Arguments")
-    logging_group.add_argument("--log_level", type=str, default="WARNING", choices=list(logging.getLevelNamesMapping()), help="Logging level.")
-    
+    logging_group.add_argument(
+        "--log_level",
+        type=str,
+        default="WARNING",
+        choices=list(logging.getLevelNamesMapping()),
+        help="Logging level.",
+    )
+
     args = parser.parse_args(argv)
 
     log_level = logging.getLevelNamesMapping().get(args.log_level.upper())
@@ -178,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     run_eval(args)
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

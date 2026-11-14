@@ -1,6 +1,8 @@
-from realtime_speech_separation import AudioTokenizer
-import torch
 import argparse
+
+import torch
+
+from realtime_speech_separation import AudioTokenizer
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract codec embeddings from AudioTokenizer")
@@ -8,7 +10,7 @@ if __name__ == "__main__":
         "--codec_model",
         type=str,
         default="MagiCodec-50Hz-Base",
-        help="The codec model to use for extracting embeddings."
+        help="The codec model to use for extracting embeddings.",
     )
     args = parser.parse_args()
 
