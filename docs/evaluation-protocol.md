@@ -8,8 +8,8 @@ Every sample to evaluate will consist of three audio recordings:
 - **<file_id>_reference.wav:** stereo reference recording where the target speaker (T)
   is isolated on the left channel and the residual speakers (R) 
   is on the right channel. **Shape: (2, n)**
-- **<file_id>_separated.wav:** stereo output of the separator model, an estimate
-  of <file_id>_reference.wav. **Shape: (2, n)**
+- **<file_id>_separated\_<args_hash>.wav:** stereo output of the separator model under a particular
+  set of inference arguments, an estimate of <file_id>_reference.wav. **Shape: (2, n)**
 
 where:
 - **n:** number of samples in the input mixture, reference, and separated recordings (must be the same across all three).
@@ -38,7 +38,8 @@ reference_audio, _ = librosa.load(ref_file, sr=sr, mono=False, dtype=np.float32)
 separated_audio, _ = librosa.load(sep_file, sr=sr, mono=False, dtype=np.float32)
 ```
 
-We expect all audio files to be stored as 32-bit floating point WAV (subtype="FLOAT") prior to evaluation.
+We expect input_file, ref_file, and sep_file to be stored as 32-bit floating point WAV (subtype="FLOAT") prior to evaluation,
+but do not enforce this in the evaluation code itself.
 
 #### Utterance Identification
 
