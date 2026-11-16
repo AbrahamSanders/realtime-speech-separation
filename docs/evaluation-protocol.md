@@ -9,7 +9,9 @@ Every sample to evaluate will consist of three audio recordings:
   is isolated on the left channel and the residual speakers (R) 
   is on the right channel. **Shape: (2, n)**
 - **<file_id>_separated\_<args_hash>.wav:** stereo output of the separator model under a particular
-  set of inference arguments, an estimate of <file_id>_reference.wav. **Shape: (2, n)**
+  set of inference arguments, an estimate of <file_id>_reference.wav. **Shape: (2, n)**.
+  Target-only output may instead have **shape: (n,)** or **(1, n)**; evaluation
+  standardizes both to **(1, n)**.
 
 where:
 - **n:** number of samples in the input mixture, reference, and separated recordings (must be the same across all three).
@@ -20,6 +22,11 @@ Evaluation includes the following metrics:
 1. **Separation Quality** - SI-SDRi, Speech Activity P/R/F1
 2. **Speaker Similarity** - Cosine similarity of speaker embeddings
 3. **Audio Quality & Perceptibility** - PESQ, STOI, ViSQOL, DNSMOS-P.808, WER
+
+SI-SDRi is the primary reconstruction measure. PESQ, STOI, and ViSQOL are reported
+as absolute output scores. Absolute SI-SDR, mixture baselines, and STOI improvement
+are supplementary measurements for interpreting the primary results; each
+absolute/improvement pair describes the same underlying metric.
 
 Measurements are done independently on both the target (T) and residual (R) channels,
 assuming the R channel is available in the separator model output. Some baseline separators
@@ -45,6 +52,10 @@ but do not enforce this in the evaluation code itself.
 
 1. [Silero VAD](https://github.com/snakers4/silero-vad) is used at 16 kHz to identify VAD-active regions
    from the T and R channels of the reference and separated recordings.
+   Run VAD directly on the supplied WAVs, independently of any dataset VAD files.
+   Use speech threshold 0.5, exit threshold 0.35, minimum silence 100 ms,
+   timestamp padding 0 ms, and minimum speech duration 0 ms. Preserve these raw
+   timestamp intervals before applying the following utterance filters.
 2. Contiguous regions within 1 second are merged to form longer active regions. 
 3. Regions shorter than 0.5 seconds or containing less than 0.5 seconds of active speech are discarded to ensure reliable evaluation.
 4. Utterances are defined as the regions that remain after merging contiguous regions and discarding short regions.
@@ -61,15 +72,50 @@ Overlap regions are identified by the temporal intersections of VAD-active regio
 
 #### Transcription
 
-[whisper.cpp](https://github.com/ggml-org/whisper.cpp) is used to transcribe the full T and R channels of the reference and separated recordings,
-using the whisper-large-v3-turbo model.
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp), through the in-process
+[pywhispercpp binding](https://github.com/absadiki/pywhispercpp), is used to transcribe
+the full T and R channels of the reference and separated recordings using the
+whisper-large-v3-turbo model. Feed the full 16 kHz channel waveforms without
+utterance segmentation or evaluation-VAD masking, and do not carry transcription
+context between independent channels or recordings.
 
 #### Speaker Embeddings
 
-[WeSpeaker toolkit](https://github.com/wenet-e2e/wespeaker) is used to extract speaker embeddings for all utterances on all channels in all recordings,
-using a model appropriate for multilingual speech.
-The reference embeddings on the T and R channels are separately averaged **across all** utterances to create target and residual speaker prototypes.
-The separated embeddings on the T and R channels are taken for each utterance of at least 3 seconds to create utterance-level speaker embeddings.
+[WeSpeaker toolkit](https://github.com/wenet-e2e/wespeaker) is used to extract speaker
+embeddings using a model appropriate for multilingual speech. Reference utterances
+must contain at least 3 seconds of raw VAD-active speech to contribute to a
+prototype; silent gaps inside a merged utterance do not count toward this minimum.
+The eligible reference embeddings on T and R are separately averaged with equal
+utterance weight **within each evaluation recording** to create target and residual
+speaker prototypes. If none qualifies on a channel, its prototype and speaker
+similarity measurements are unavailable. Do not fall back to shorter reference
+utterances or pool unrelated speakers across recordings.
+
+The separated embeddings on T and R are taken for each utterance with a span of
+at least 3 seconds to create utterance-level speaker embeddings. Keep the selected
+model and frontend fixed across separator comparisons.
+
+#### Silent Channels and Missing Speech
+
+A silent reference channel does not invalidate the evaluation sample. Its
+reference-utterance metrics have no candidates; the other channel is evaluated
+independently. Activity measurements still use raw VAD over the full recording,
+so spurious output speech contributes false positives and missing reference speech
+contributes false negatives. Raw speech too short to become an utterance still
+contributes to activity and may qualify under the separate overlap rules.
+
+When reference speech has an all-zero estimate, retain the reference utterance
+and evaluate each metric according to its definition. SI-SDR and its improvement
+are undefined for zero-energy estimates after centering; report `null` with an
+explicit reason and a silent-estimate diagnostic. Do not report a stabilized
+numerical placeholder as a valid score. A zero-energy reference is ineligible;
+a zero-energy mixture baseline makes improvement unavailable. A quiet nonzero
+estimate must not be excluded merely because VAD detects no speech.
+
+DNSMOS and similarity have no separated-utterance candidates when the output has
+no qualifying speech. Full-channel transcription still runs. WER retains insertions
+for empty reference transcripts and deletions for missing words; ASR can itself
+hallucinate, so VAD must not silently replace its text with an empty transcript.
 
 ## Separation Quality
 
@@ -142,6 +188,22 @@ We measure:
 1. Target PESQ, STOI, ViSQOL: Scores between the Separated and Reference T channel for each reference T channel utterance.
 2. Residual PESQ, STOI, ViSQOL: Scores between the Separated and Reference R channel for each reference R channel utterance.
 
+### Supplementary STOI Improvement
+
+For supplementary analysis, measure STOI improvement relative to the input
+mixture on each reference channel utterance:
+
+`STOIi = STOI(reference, separated) - STOI(reference, input_mixture)`
+
+Both calls use the same reference waveform and time interval, with the reference
+as the first argument. Positive values indicate improved intelligibility. Report
+the absolute difference in STOI units; multiplying by 100 expresses percentage
+points, not a relative percentage change. Retain both the mixture and separated
+scores, and average the per-utterance differences during aggregation. A missing
+baseline makes improvement unavailable without erasing a valid separated STOI.
+This reporting convention is used in
+[speech separation research](https://www.isca-archive.org/interspeech_2018/tan18b_interspeech.pdf).
+
 ### DNSMOS-P.808
 
 DNSMOS measures the perceptual quality of the separated channels using a deep neural network-based model.
@@ -179,4 +241,16 @@ When the evaluation CLI generates the summary report JSON, it should:
    In addition to the mean, also compute the distribution (min, p10, q1, median, q3, p90, max).
 
 ## Reporting
-Not all utterances will qualify for all metrics. For example, speaker similarity is only measured for utterances of at least 3 seconds, and other metrics may have their own eligibility criteria. The reporting should clearly indicate the proportion of utterances considered for each metric, along with the aggregated scores.
+
+Not all utterances will qualify for all metrics. A metric's **candidates** are
+the utterances in its source population before its specific eligibility rules;
+**eligible** candidates meet those rules, and **scored** candidates successfully
+produce a defined value. Report scored/candidate and scored/eligible coverage,
+with counts and reasons for ineligible, undefined, and failed observations.
+Report reference prototype eligibility separately from separated speaker-score
+coverage. Undefined ratios and empty score distributions are `null`.
+
+Preserve recording-level results when one channel or metric is unavailable.
+Include counts of inactive reference channels and silent estimates on reference
+utterances so the valid-score means do not conceal missing or spurious speech.
+
