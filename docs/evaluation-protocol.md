@@ -242,6 +242,13 @@ When the evaluation CLI generates the summary report JSON, it should:
 
 ## Reporting
 
+Support separate reports for the full validation or test set and for selections
+by source dataset. Dataset reports are primary evaluation results: two-speaker
+recordings have one residual speaker, while multiparty recordings can have two
+or more. Residual similarity to a single averaged prototype can therefore be
+lower on multiparty audio, even with good separation. Each report must summarize
+only its selected recordings and coexist with reports for other selections.
+
 Not all utterances will qualify for all metrics. A metric's **candidates** are
 the utterances in its source population before its specific eligibility rules;
 **eligible** candidates meet those rules, and **scored** candidates successfully
