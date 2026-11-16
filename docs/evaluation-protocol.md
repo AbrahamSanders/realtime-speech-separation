@@ -60,6 +60,10 @@ but do not enforce this in the evaluation code itself.
 3. Regions shorter than 0.5 seconds or containing less than 0.5 seconds of active speech are discarded to ensure reliable evaluation.
 4. Utterances are defined as the regions that remain after merging contiguous regions and discarding short regions.
 
+Intervals use half-open sample bounds `[start, end)` at 16 kHz. A gap of exactly
+1 second is merged; duration minima are inclusive. Keep the original active
+sample count through merging, excluding silent gaps.
+
 #### Overlap Identification
 
 Overlap regions are identified by the temporal intersections of VAD-active regions on the T and R channels.
@@ -70,6 +74,11 @@ Overlap regions are identified by the temporal intersections of VAD-active regio
 4. Overlap regions shorter than 0.2 seconds or containing less than 0.2 seconds of active speech are discarded,
    and remaining overlap regions shorter than 0.5 seconds are padded evenly on both sides to reach 0.5 seconds.
 
+At a recording boundary, move unavailable padding to the other side. If the
+whole recording cannot supply a 0.5-second span, the region is ineligible.
+For an odd padding sample count, put the extra sample on the right before
+adjusting for boundaries. Padding does not increase the original active duration.
+
 #### Transcription
 
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp), through the in-process
@@ -78,6 +87,11 @@ the full T and R channels of the reference and separated recordings using the
 whisper-large-v3-turbo model. Feed the full 16 kHz channel waveforms without
 utterance segmentation or evaluation-VAD masking, and do not carry transcription
 context between independent channels or recordings.
+
+Use transcription, not translation. Detect the language independently from each
+full reference channel and use that language for its corresponding separated
+channel. An explicit language override applies to both reference and separated
+channels. Record the resolved language and decoding settings.
 
 #### Speaker Embeddings
 
@@ -90,6 +104,11 @@ utterance weight **within each evaluation recording** to create target and resid
 speaker prototypes. If none qualifies on a channel, its prototype and speaker
 similarity measurements are unavailable. Do not fall back to shorter reference
 utterances or pool unrelated speakers across recordings.
+
+Average the raw embeddings before cosine normalization; do not normalize each
+utterance embedding before averaging. A failed required embedding extraction
+makes that channel's prototype unavailable rather than dropping the utterance
+and constructing a different prototype. A zero-norm prototype is also unavailable.
 
 The separated embeddings on T and R are taken for each utterance with a span of
 at least 3 seconds to create utterance-level speaker embeddings. Keep the selected
@@ -107,7 +126,10 @@ contributes to activity and may qualify under the separate overlap rules.
 When reference speech has an all-zero estimate, retain the reference utterance
 and evaluate each metric according to its definition. SI-SDR and its improvement
 are undefined for zero-energy estimates after centering; report `null` with an
-explicit reason and a silent-estimate diagnostic. Do not report a stabilized
+explicit reason and a `separated_missing_utterances` diagnostic. Centering means
+subtracting each interval waveform's arithmetic mean. These missing-utterance
+diagnostics refer to zero-energy separated waveforms after that subtraction,
+independently of whether separated VAD detects speech. Do not report a stabilized
 numerical placeholder as a valid score. A zero-energy reference is ineligible;
 a zero-energy mixture baseline makes improvement unavailable. A quiet nonzero
 estimate must not be excluded merely because VAD detects no speech.
@@ -134,6 +156,14 @@ possible assignments of separated channels to reference channels). Since we have
 we expect the separated T channel to always correspond to the reference T channel and thus do not allow 
 for permutation matching.
 
+Use TorchMetrics' functional SI-SDR with `zero_mean=True` and float32 tensors
+for both calls. Its [metric-backend implementation](https://github.com/Lightning-AI/torchmetrics/blob/master/src/torchmetrics/functional/audio/sdr.py)
+uses `torch.finfo(preds.dtype).eps` (2**-23 for float32) in the projection numerator
+and denominator and in both energy sums before the log ratio. Record the metric
+backend version and these settings. Check centered zero energy before the metric-backend call,
+as specified under silent channels; epsilon stabilization does not make those
+undefined cases valid. Apply no positive energy cutoff to quiet nonzero signals.
+
 We make the following SI-SDRi measurements:
 
 #### Overall separation performance
@@ -157,6 +187,8 @@ num_frames = math.ceil(reference.shape[-1] / int(0.1 * sr))
 ```
 For all Separated and Reference channels, we construct a boolean mask indicating speech activity in each 100ms frame.
 A frame is considered active if the majority of its span overlaps with VAD activity on the same channel.
+The majority is strict: more than 50% is active; an exact tie is inactive.
+Use the actual span of the last partial frame, without padding it to 100 ms.
 
 *Note*: We use the raw VAD output, not the merged and filtered utterance intervals, to determine frame-level speech activity.
 
@@ -222,11 +254,29 @@ We measure:
 1. Target WER: WER between the separated and target transcriptions of the T channel.
 2. Residual WER: WER between the separated and residual transcriptions of the R channel.
 
+Apply the same normalization to both transcripts in this order: Unicode NFC,
+Unicode lowercase, removal of characters in Unicode punctuation categories
+(`P*`), and whitespace normalization using split/join. Remove punctuation rather
+than replacing it with spaces (for example, `can't` becomes `cant`); retain other
+symbols. Tokenize on whitespace. Record raw and normalized text and the
+normalizer identity with the recognizer configuration.
+
+These measurements express agreement with reference ASR, rather than human
+transcription accuracy. Whitespace WER has limited usefulness for languages whose
+words are not normally separated by spaces, including Chinese and Japanese; do
+not silently introduce language-specific tokenization between comparisons.
+
 ## Aggregation
 
 - Activity P/R/F1 can be aggregated across the evaluation set by summing up the true positives, false positives, and false negatives across all recordings and then calculating precision, recall, and F1 score from these aggregated counts.
 - WER can be aggregated across the evaluation set by summing up the substitutions, deletions, insertions, and reference word counts across all recordings and then calculating the overall WER from these aggregated counts.
 - All other metrics can be aggregated across the evaluation set by averaging the per-utterance scores, regardless of the recording they belong to.
+
+Activity precision, recall, or F1 is `null` when its own denominator is zero.
+Corpus WER is `null` when total reference words are zero; otherwise include all
+insertions, including those from empty reference transcripts. A recording with
+zero reference words therefore still contributes insertions to a corpus with
+nonzero reference words. Never average recording-level WER or activity ratios.
 
 For each evaluation sample (consisting of the input mixture, reference, separated recordings),
 the evaluation CLI should output a JSON file with:
@@ -239,6 +289,12 @@ When the evaluation CLI generates the summary report JSON, it should:
 2. Sum up all substitutions, deletions, insertions, and reference word counts across all evaluation samples and calculate the aggregated WER from these counts.
 3. Average the per-utterance scores for all other metrics across all evaluation samples to obtain the aggregated scores.
    In addition to the mean, also compute the distribution (min, p10, q1, median, q3, p90, max).
+
+Use NumPy's `linear` percentile method and population standard deviation
+(`ddof=0`). An empty distribution has count zero and `null` statistics; a
+singleton has identical quantiles and zero standard deviation. Improvement
+distributions use the paired per-interval differences, retaining available
+absolute output scores even when the mixture baseline is unavailable.
 
 ## Reporting
 
@@ -253,11 +309,17 @@ Not all utterances will qualify for all metrics. A metric's **candidates** are
 the utterances in its source population before its specific eligibility rules;
 **eligible** candidates meet those rules, and **scored** candidates successfully
 produce a defined value. Report scored/candidate and scored/eligible coverage,
-with counts and reasons for ineligible, undefined, and failed observations.
+with counts and reasons for ineligible, undefined, and failed interval results.
 Report reference prototype eligibility separately from separated speaker-score
 coverage. Undefined ratios and empty score distributions are `null`.
 
+Every candidate has one outcome: `scored`, `ineligible`, `undefined`, or `failed`.
+Undefined and failed interval results count as eligible; only `ineligible` removes
+a candidate from the eligibility denominator. Run eligibility checks before
+speaker-backend extraction or metric-backend scoring. Disabled metrics and missing
+output channels have explicit availability statuses and contribute no interval candidates.
+
 Preserve recording-level results when one channel or metric is unavailable.
-Include counts of inactive reference channels and silent estimates on reference
-utterances so the valid-score means do not conceal missing or spurious speech.
+Include counts of inactive reference channels and reference utterances with silent
+separated output so the valid-score means do not conceal missing or spurious speech.
 

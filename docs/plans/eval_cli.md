@@ -1,6 +1,7 @@
 # Evaluation CLI implementation plan
 
-Status: planned; runtime implementation has not started.
+Status: Stage 1 implemented; CLI integration and metric, VAD, speaker, and ASR
+backends remain planned.
 
 ## Objective and scope
 
@@ -30,8 +31,8 @@ The main files are [`eval_cli.py`](../../src/realtime_speech_separation/eval_cli
   with protocol preprocessing and metric adapters.
 - Restrict separated-file discovery to audio files and parse the entire inference
   suffix relative to the mixture stem.
-- Replace flat channel vectors with interval observations, raw counts, and
-  metric-specific coverage. Pool observations instead of recording means, and
+- Replace flat channel vectors with interval results, raw counts, and
+  metric-specific coverage. Pool interval scores instead of recording means, and
   preserve other scores when one metric fails.
 - Replace unconditional reuse of existing JSON with configuration/source checks.
   Keep filtered summaries limited to the selected inputs, including cached ones.
@@ -43,6 +44,12 @@ The main files are [`eval_cli.py`](../../src/realtime_speech_separation/eval_cli
 Resolve compatible versions in each owning stage, using local Python 3.12 and
 checking the package's supported Python versions. Keep runtime dependencies out
 of base/dev installs.
+
+A backend is the external implementation called by an evaluation adapter:
+metric backends compute scores (for example, TorchMetrics or PESQ), the VAD
+backend detects speech (Silero), the speaker backend extracts embeddings
+(WeSpeaker with ONNX Runtime), and the ASR backend transcribes audio
+(pywhispercpp). Qualify backend references by the component they implement.
 
 | Component | Implementation | Integration notes |
 | --- | --- | --- |
@@ -64,18 +71,17 @@ The latter extras include `eval`. Document ViSQOL native setup separately.
 Replace Asteroid when core metrics land; retain pandas only if reporting uses it.
 Avoid broad toolkit extras and changes to unrelated dependency groups.
 
-## Remaining protocol decisions
+## Accepted protocol decisions
 
-Settle these in Stage 1 and record accepted metric semantics in the protocol.
-Existing protocol rules, including silence handling and prototype scope, remain
-authoritative.
+Settled in Stage 1 and recorded in the [protocol](../evaluation-protocol.md).
+The following is the implementation checklist; the protocol owns the definitions.
 
 - **Overlap padding:** at recording boundaries, move unavailable padding to the
   other side. If the recording cannot provide a 0.5-second span, mark the region
   ineligible.
 - **Activity frames:** a strict majority means more than 50%; ties are inactive.
   Use the actual duration of the final partial frame.
-- **SI-SDR:** use `zero_mean=True`; record dtype and backend epsilon behavior.
+- **SI-SDR:** use `zero_mean=True`; record dtype and metric-backend epsilon behavior.
 - **Prototypes:** average raw reference embeddings with equal utterance weight,
   then apply ordinary cosine normalization. A failed required reference embedding
   makes that channel's prototype unavailable.
@@ -92,7 +98,7 @@ authoritative.
 Keep argument parsing, logging, and discovery in `eval_cli.py`. Put the pipeline
 under `src/realtime_speech_separation/evaluation/`:
 
-- `types.py`: typed configuration, interval, observation, and result records.
+- `types.py`: typed configuration, interval, speech-region, and metric/count result records.
 - `audio.py`: triple loading and validation.
 - `vad.py`: Silero adapter, interval operations, utterances, overlap, and activity.
 - `metrics.py`: SI-SDR/STOI/PESQ/ViSQOL/DNSMOS adapters.
@@ -100,11 +106,11 @@ under `src/realtime_speech_separation/evaluation/`:
 - `reporting.py`: serialization, result reuse, aggregation, and CSV output.
 - `pipeline.py`: per-recording preparation, metric calls, and resource reuse.
 
-### Shared backend and error handling
+### Metric, VAD, speaker, and ASR backend error handling
 
-Use small functions with injectable backend calls and a fixed metric dispatch
-table. Keep optional imports inside selected adapters so package import and CLI
-help work without evaluation backends.
+Use small functions with injectable metric, VAD, speaker, and ASR backend calls
+and a fixed metric dispatch table. Keep optional imports inside selected adapters
+so package import and CLI help work without those external libraries.
 
 - Preflight requested packages/assets and load each model/session once. Default
   to CPU with bounded threads and inference mode. Provision assets separately;
@@ -112,11 +118,11 @@ help work without evaluation backends.
 - Validate audio once at the loading boundary. Represent missing/unreadable files
   and invalid waveforms with one recording-error record containing path and
   reason; reuse decoder exceptions for file errors.
-- Map documented scoring exceptions/warnings to observation statuses and reasons.
-  Convert nonfinite scores to failed observations with `null` values. Preserve
+- Map documented scoring exceptions/warnings to interval-result statuses and reasons.
+  Convert nonfinite scores to failed interval results with `null` values. Preserve
   other metrics and channels. Do not hide unexpected programming errors.
 - Use strict JSON (`allow_nan=False`) and atomic per-result writes. Return nonzero
-  for configuration, invalid-input, or requested-backend execution failures;
+  for configuration, invalid-input, or requested metric/VAD/speaker/ASR backend failures;
   valid ineligibility and mathematically undefined scores are reportable outcomes.
 - Reuse reference VAD, baselines, embeddings, and transcripts across inference
   variants in memory. Keep this reuse local to the mixture being evaluated.
@@ -126,22 +132,30 @@ help work without evaluation backends.
 
 Define one schema containing:
 
-- Evaluator revision, inference hash, evaluation ID, resolved configuration,
-  backend versions, and model content digests.
+- Package version, inference hash, evaluation ID, resolved configuration,
+  metric/VAD/speaker/ASR backend versions, and model content digests.
 - Relative input paths, source content hashes, native rates/channel counts,
-  evaluation rate/sample count, and available output channels.
-- Raw VAD, utterance, and reference-overlap intervals with IDs, sample bounds,
-  and original active duration. Derive spans from bounds.
+  evaluation rate/sample count, and channel availability. Derive output channels
+  from availability rather than storing a second channel list in JSON.
+- Raw VAD intervals with sample bounds. Utterance and reference-overlap
+  `SpeechRegion` records reference an `Interval` and retain original active
+  samples separately, excluding merged gaps and added padding. Raw VAD intervals
+  are fully active and need no separate active-sample count. Derive spans from
+  bounds.
 - Activity TP/FP/FN and frame counts; WER S/D/I/reference-word counts, status,
   and raw/normalized full-channel transcripts.
-- T/R observations for `si_sdri`, `overlap_si_sdri`, `stoi`, `stoii`, `pesq`,
-  `visqol`, `dnsmos_p808`, and `speaker_cosine`. Each has an interval ID/origin,
+- T/R `IntervalMetricResult` records for `si_sdri`, `overlap_si_sdri`, `stoi`, `stoii`,
+  `pesq`, `visqol`, `dnsmos_p808`, and `speaker_cosine`. Each references its interval,
+  with `interval_source` specifying how its bounds were selected,
   status (`scored`, `ineligible`, `undefined`, or `failed`), value or `null`,
   and reason where needed. Improvement records retain input/output scores.
-- Reference-prototype eligibility/extraction records and silent-estimate
-  diagnostics. Disabled metrics and unavailable channels have explicit statuses.
+- Reference-prototype eligibility/extraction records and `separated_missing_utterances`
+  diagnostics. These reference utterance intervals have corresponding separated
+  waveforms with zero energy after subtracting their own arithmetic means; this is independent of
+  separated VAD activity. Disabled metrics and unavailable channels have explicit
+  statuses.
 
-Derive coverage counts and reason totals from observations during reporting;
+Derive coverage counts and reason totals from interval results during reporting;
 maintain no parallel mutable counters. Use the protocol's candidate/eligible/scored
 rules. Candidates are reference utterances for intrusive metrics, reference
 overlap regions for overlap SI-SDRi, and separated utterances for DNSMOS/similarity.
@@ -149,18 +163,26 @@ Report activity/WER coverage in recording, frame, and word units as appropriate.
 
 Group summaries by inference hash and evaluation ID. Apply the protocol's pooled
 aggregation independently per channel, metric, and overall/overlap condition.
-Use NumPy's `linear` percentile method and record it in configuration. Compute
-improvement distributions from paired observations. Derive recording counts for
-processed, invalid, reused, target-only, and failed cases, along with inactive
-reference channels and active output frames on those channels.
+Use NumPy's fixed `linear` percentile method and record it in summary metadata.
+Compute improvement distributions from paired interval results. Derive recording
+counts for processed, invalid, reused, target-only, and failed cases, along with
+inactive reference channels and active output frames on those channels.
 
-The evaluation ID hashes the evaluator revision, selected metrics, score/report
-parameters, backend versions, and model digests. Record exposed native-library
-versions where relevant; exhaustive native-build fingerprints are deferred.
+The evaluation ID hashes the package version, selected metrics, score/report
+parameters, metric/VAD/speaker/ASR backend versions, and model digests. Record
+exposed native-library versions where relevant; exhaustive native-build
+fingerprints are deferred.
 Source audio hashes are separate result-validity keys so recordings can share
-an evaluation ID. Reuse only schema-compatible results with matching IDs/hashes;
+an evaluation ID. Reuse only structurally compatible results with matching IDs/hashes;
 recompute stale, legacy, interrupted, or failed results. Valid ineligible or
-undefined observations do not prevent reuse. `--overwrite` forces recomputation.
+undefined interval results do not prevent reuse. `--overwrite` forces recomputation.
+
+Package versions identify published result formats and evaluation behavior; no
+independent schema or evaluator revision counters are maintained. Developers
+changing records or scoring within the same package version must clean their
+local evaluation outputs and regenerate them. Track `cached_result_paths` only
+for the current CLI invocation to count separations whose result JSONs were
+loaded from disk, without modifying their persisted results.
 
 ### Full-set and dataset reports
 
@@ -183,8 +205,8 @@ These report files must coexist. Select datasets through their paths; evaluation
 still requires no dataset metadata.
 
 The CSV has one row per separation with T/R scalar summaries, raw counts,
-statuses, and coverage. Corpus summaries use raw observations/counts rather than
-CSV recording means. Detailed observations remain in JSON; a separate utterance
+statuses, and coverage. Corpus summaries use raw interval scores/counts rather than
+CSV recording means. Detailed interval results remain in JSON; a separate utterance
 CSV is deferred.
 
 ## Implementation stages
@@ -197,7 +219,7 @@ above. Record completion, checks, and deviations here as work proceeds.
 
 - Read the protocol, current CLI, package tests, and dependency manifest. Settle
   the remaining protocol decisions above, keeping CLI usage in the README.
-- Add `types.py` and pure reporting functions: schema, evaluator revision marker,
+- Add `types.py` and pure reporting functions: result records, package-version provenance,
   strict serialization, configuration identity, coverage, and pooled aggregation.
 - Keep reporting tests runnable with base/dev dependencies. Resolve runtime
   dependencies in their owning stages.
@@ -205,7 +227,100 @@ above. Record completion, checks, and deviations here as work proceeds.
 **Tests:** hand-built records with unequal utterance counts, activity/WER from
 summed counts, partial metric failures, missing residuals, zero denominators,
 empty/singleton distributions, and JSON round trips. Test compatible-result
-parsing and configuration/source mismatches here rather than per backend.
+parsing and configuration/source mismatches here rather than per metric, VAD,
+speaker, or ASR backend.
+
+**Implementation notes:**
+
+- Added the `evaluation` package, which imports no metric, VAD, speaker, or ASR
+  backends, with
+  [`types.py`](../../src/realtime_speech_separation/evaluation/types.py) and
+  [`reporting.py`](../../src/realtime_speech_separation/evaluation/reporting.py).
+  Package version from `realtime_speech_separation.__version__` is recorded in
+  configuration for per-separation JSON and summaries and participates in evaluation
+  identity. Separate schema/evaluator counters were removed after review. Published
+  versions control compatibility; developers regenerate local results after
+  changing records within the same version.
+- `Interval(start, end)` has no string ID or active-sample count. Raw VAD uses
+  these bounds directly. `SpeechRegion(interval, active_samples)` adds original
+  activity only for utterances and overlap regions. `IntervalMetricResult`,
+  `ReferenceEmbeddingExtractionResult`, and `separated_missing_utterances` refer
+  directly to intervals in Python; JSON embeds their bounds. `output_channels`
+  is a read-only property derived from channel availability and omitted from JSON.
+- `IntervalResultStatus` describes individual interval scores/extractions;
+  `CountResultStatus` describes full-channel activity/WER outcomes. Docstrings
+  give examples for these statuses, prototype availability, and recording outcomes.
+  `interval_source` states which VAD population selected the bounds. Paired-score
+  examples explain `value = output_score - input_score` for improvement metrics.
+  `ReferencePrototypeExtractionResult` groups the reference embedding extraction
+  outcomes. Speaker vectors remain in adapter memory; reporting records retain eligibility
+  and extraction outcomes without vectors.
+- Assumptions accepted in the protocol: exact merge/duration thresholds are
+  inclusive; odd overlap padding puts the extra sample on the right; activity
+  ties are inactive, with actual final-frame duration; SI-SDR uses float32,
+  subtraction of the interval waveform's mean, and TorchMetrics' metric-backend
+  dtype epsilon. Prototypes average raw embeddings with equal utterance weight
+  before cosine normalization. WER deletes Unicode
+  `P*` punctuation without inserting spaces and retains symbols, following NFC
+  and lowercase. Reference-channel language detection is shared with its output,
+  with an override; ASR performs transcription. Whitespace WER is labeled as
+  agreement with reference ASR and its language limitations are documented.
+- Reporting choices: zero denominators produce `null`; undefined/failed
+  candidates remain eligible; disabled/unavailable metrics add no candidates.
+  Percentiles use the fixed NumPy `linear` method, recorded in summary metadata;
+  there is no percentile constructor parameter. Evaluation remains at 16 kHz.
+  SD uses `ddof=0`, and paired improvement scores are checked against their
+  retained input/output scores. Absolute components
+  remain reportable when a baseline or improvement is unavailable. Prototype
+  coverage is independent of separated-utterance coverage. Activity coverage
+  includes candidate/scored recordings and frames; WER coverage includes scored
+  reference words and empty-reference recordings. Unknown word totals after
+  failed ASR are not estimated.
+- Identity uses full SHA-256 over canonical JSON, including package version,
+  sorted/deduplicated selected metrics, resolved parameters, fixed percentile method,
+  and logical model content digests. Metric, VAD, speaker, and ASR library versions
+  are recorded in `metric_backend_versions` and the singular
+  `vad_backend_version`, `speaker_backend_version`, and `asr_backend_version`
+  strings (null when unused). The caller must
+  supply resolved settings/defaults when each adapter lands. Source paths/content
+  hashes are separate reuse keys; native metadata is informational. Selection terms/paths stay out
+  of evaluation identity. Filter identities lowercase/sort/deduplicate terms
+  without stripping them, preserving substring semantics.
+- Parsing requires all record fields and rejects unknown fields, invalid types,
+  duplicate keys, and inconsistent identities. Reuse rejects results from other
+  package versions, missing source hashes, and any recording or metric/VAD/speaker/ASR
+  backend failure, while valid ineligible/undefined outcomes remain reusable.
+  Writes use strict UTF-8 JSON and atomic replacement. Nonfinite metric-backend
+  scores become failed interval results; nonfinite configuration/serialization
+  values are rejected.
+- `processed` counts valid evaluated recording results, including cached and
+  partially failed results; `failed` counts any such result with metric/VAD/speaker/ASR
+  backend failures. `invalid` is separate. `reused` counts results loaded from disk
+  during this CLI invocation using `cached_result_paths`; cached JSONs are not modified.
+  `separated_missing_utterances` identifies reference intervals whose separated
+  waveforms have zero energy after mean subtraction, independently of VAD activity.
+  Summaries require one inference/evaluation identity and reject duplicate
+  separations. Selection/discovery enforcement, filenames, CSV output, and exit
+  statuses remain in their planned integration stages.
+- No runtime dependencies or CLI usage changed. Installation tests now import
+  the reporting package in isolation and verify that optional metric, VAD,
+  speaker, and ASR backends stay unloaded. Stage-specific offline tests cover
+  the required aggregation/reuse
+  boundaries, strict JSON, and atomic-write failure behavior.
+
+**Checks:** in the `audio` environment on Python 3.12.13,
+`python -m ruff check .`, `python -m ruff format --check .`, and
+`python -m pytest` all passed after the review changes (64 tests, including 61
+reporting cases). Tests cover direct interval references, separate active-sample
+counts, package-version cache checks, and omission of the derived output-channel
+property from JSON, alongside the original aggregation boundaries.
+Pytest emitted one installed AnyIO plugin deprecation warning about `CallSpec2`.
+`git diff --check` passed. No model, native metric-backend, or GPU checks are
+needed for this stage; no checks were blocked.
+
+**Deviations:** review replaced independent schema/evaluator version markers with
+package-version provenance and direct interval references. Metric/VAD/speaker/ASR
+backend version resolution remains in owning stages.
 
 ### Stage 2 — Load audio triples and fix discovery
 
@@ -220,7 +335,7 @@ parsing and configuration/source mismatches here rather than per backend.
 - Remove enrollment loading. Match adjacent separated audio by mixture stem and
   supported extension, ignore sidecars/directories, sort deterministically, and
   retain the entire inference suffix. Preserve input filtering locally to eval;
-  keep any backend files outside discovery paths.
+  keep metric/VAD/speaker/ASR backend assets outside discovery paths.
 
 **Tests:** small temporary WAV triples covering mono/stereo estimates, one
 resampling case, absent enrollment, unreadable/missing audio, invalid waveforms,
@@ -233,7 +348,7 @@ with sidecars, multiple inference suffixes, and filters.
   passing the protocol's explicit parameters. Run it on reference T/R and each
   available separated channel.
 - Represent intervals as sorted, disjoint half-open sample bounds `[start, end)`.
-  Check backend intervals once, then use small merge/intersection helpers.
+  Check VAD-backend intervals once, then use small merge/intersection helpers.
 - Construct utterances and overlap from raw activity using protocol thresholds.
   Active duration cannot exceed span, so the active-duration threshold also
   enforces the matching span minimum. Preserve active duration across merged
@@ -264,7 +379,7 @@ adapter verifies channel calls, state reset, and reference reuse.
 **Tests:** use known adapter returns to check argument order, paired differences,
 fixed T/R assignment, interval-specific baselines, silent estimates/zero-energy
 references, valid zero STOI, and unavailable baselines. Keep one real SI-SDR
-sanity check that mixture-as-estimate gives zero improvement in an opt-in backend
+sanity check that mixture-as-estimate gives zero improvement in an opt-in SI-SDR metric-backend
 test. Start a synthetic CLI fixture with fake VAD/metrics, then extend it through
 later stages. Cover shared resource preflight and failure isolation once.
 
@@ -272,22 +387,22 @@ later stages. Cover shared resource preflight and failure isolation once.
 
 - Add wideband PESQ over reference utterances and include it in `eval-quality`.
   Document native setup and resolved Python/NumPy compatibility.
-- Map documented no-utterance/too-short exceptions to observation reasons using
+- Map documented no-utterance/too-short exceptions to interval-result reasons using
   the selected exception mode.
 
-**Tests:** verify PESQ arguments and exception mapping with a fake backend.
+**Tests:** verify PESQ arguments and exception mapping with a fake PESQ metric backend.
 An opt-in wrapper smoke test checks a valid signal and documented error cases.
 
 ### Stage 6 — Add ViSQOL
 
 - Initialize the official API in 16 kHz speech mode with a local speech model;
   return per-utterance MOS-LQO and document native setup.
-- Establish the pinned backend's actual short-input requirements. Keep protocol
+- Establish the pinned ViSQOL metric backend's actual short-input requirements. Keep protocol
   utterances; record unsupported ones without adding padding or concatenation.
 - Investigate the official CLI only if the Python API cannot run in the target
   environment; record that decision before adding a fallback adapter.
 
-**Tests:** verify speech-mode/model configuration with a fake backend. Use an
+**Tests:** verify speech-mode/model configuration with a fake ViSQOL metric backend. Use an
 opt-in smoke test to establish native short-utterance behavior.
 
 ### Stage 7 — Add DNSMOS-P.808
@@ -301,7 +416,7 @@ opt-in smoke test to establish native short-utterance behavior.
   if that location cannot meet deployment needs.
 
 **Tests:** a fake four-component return verifies P.808 selection and separated
-utterance bounds. An opt-in backend smoke test covers short and long utterances
+utterance bounds. An opt-in DNSMOS metric-backend smoke test covers short and long utterances
 with pre-provisioned assets.
 
 ### Stage 8 — Add WeSpeaker similarity
@@ -364,8 +479,9 @@ in Stage 1 tests rather than duplicating them throughout integration tests.
 
 Add focused tests as each stage lands and run the repository checks described in
 [AGENTS.md](../../AGENTS.md#code-and-checks), using its development environment.
-Keep ordinary tests offline and CPU-only with injected backends and temporary
-synthetic audio; real model/native-backend tests are opt-in. Record checks that
+Keep ordinary tests offline and CPU-only with injected metric, VAD, speaker, and
+ASR backends and temporary synthetic audio; real model/native metric-backend tests
+are opt-in. Record checks that
 could not run, and keep runtime stacks out of base/dev CI.
 
 For the final real-data smoke test, copy a few existing triples to a temporary

@@ -25,8 +25,10 @@ def test_import_outside_repository(tmp_path: Path) -> None:
             "-I",
             "-c",
             "import json, sys, realtime_speech_separation; "
+            "import realtime_speech_separation.evaluation.reporting; "
             "assert not {'torch', 'transformers', 'codec_bpe', 'llama_cpp', "
-            "'asteroid', 'gradio'} & sys.modules.keys(); "
+            "'asteroid', 'gradio', 'silero_vad', 'torchmetrics', 'pystoi', 'pesq', "
+            "'onnxruntime', 'torchaudio', 'pywhispercpp', 'jiwer'} & sys.modules.keys(); "
             "print(json.dumps(realtime_speech_separation.__version__))",
         ],
         cwd=tmp_path,
