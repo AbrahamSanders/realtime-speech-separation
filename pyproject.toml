@@ -37,7 +37,7 @@ client = [
 eval = [
     "asteroid>=0.7",
     "pandas>=2.2",
-    "silero-vad>=5",
+    "silero-vad>=6.2.1",
 ]
 training = [
     "accelerate>=1",

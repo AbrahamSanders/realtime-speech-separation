@@ -1,6 +1,6 @@
 # Evaluation CLI implementation plan
 
-Status: Stages 1–2 implemented; protocol pipeline integration and metric, VAD,
+Status: Stages 1–3 implemented; protocol pipeline integration and metric,
 speaker, and ASR backends remain planned.
 
 ## Objective and scope
@@ -113,7 +113,8 @@ and a fixed metric dispatch table. Keep optional imports inside selected adapter
 so package import and CLI help work without those external libraries.
 
 - Preflight requested packages/assets and load each model/session once. Default
-  to CPU with bounded threads and inference mode. Provision assets separately;
+  to CPU and use backend-provided inference handling. Leave runtime thread
+  configuration to the user and external libraries. Provision assets separately;
   evaluation must run offline without automatic downloads or GPU selection.
 - Validate audio once at the loading boundary. Represent missing/unreadable files
   and invalid waveforms with one recording-error record containing path and
@@ -408,11 +409,12 @@ integration remains in Stage 4 and Stage 10.
 
 ### Stage 3 — Add VAD, intervals, and activity
 
-- Add the Silero adapter in `vad.py`, resetting state per channel/recording and
-  passing the protocol's explicit parameters. Run it on reference T/R and each
-  available separated channel.
+- Add the Silero adapter in `vad.py`, relying on Silero to reset state per
+  channel/recording and passing the protocol's explicit parameters. Run it on
+  reference T/R and each available separated channel.
 - Represent intervals as sorted, disjoint half-open sample bounds `[start, end)`.
-  Check VAD-backend intervals once, then use small merge/intersection helpers.
+  Trust Silero timestamp bounds and ordering, then use small merge/intersection
+  helpers.
 - Construct utterances and overlap from raw activity using protocol thresholds.
   Active duration cannot exceed span, so the active-duration threshold also
   enforces the matching span minimum. Preserve active duration across merged
@@ -424,6 +426,74 @@ integration remains in Stage 4 and Stage 10.
 long spans with insufficient activity, fragmented/false overlaps, boundary
 padding, no speech/overlap, tied frames, and final partial frames. A fake Silero
 adapter verifies channel calls, state reset, and reference reuse.
+
+**Implementation notes:**
+
+- Added [`vad.py`](../../src/realtime_speech_separation/evaluation/vad.py).
+  `SileroVad` lazily imports its runtime and loads the packaged JIT model once
+  without downloads. Calls use CPU and explicit protocol timestamp parameters.
+  Silero's timestamp function owns recurrent-state reset and gradient disabling;
+  the adapter does not duplicate either operation or configure threads. It exposes
+  its Silero/PyTorch versions, packaged model SHA-256, and explicit settings for
+  Stage 4 configuration identity. Its model is reused sequentially across
+  channels and recordings; concurrent use is outside this interface.
+- The `eval` extra requires `silero-vad>=6.2.1`, the tested minimum whose
+  [release API](https://github.com/snakers4/silero-vad/blob/v6.2.1/src/silero_vad/utils_vad.py)
+  supports the explicit exit threshold and packaged model loading. Its Python
+  requirement is >=3.8, covering the project's supported versions. Base/dev and
+  unrelated dependency groups are unchanged. The installed model was checked
+  locally on Python 3.12.13 with PyTorch 2.13.0 and torchaudio 2.11.0.
+- Trust Silero's sorted, disjoint, recording-bounded sample timestamps and
+  convert them directly to `Interval` records. Removed the defensive timestamp
+  validator after review. Runtime execution failures raise `VadBackendError`;
+  unexpected programming errors propagate. Stage 4 owns conversion to recording
+  outcomes and CLI exit status. Backend versions and model digests identify
+  reproduction environments; exact dependency pins are unnecessary without a
+  demonstrated incompatibility.
+- `merge_regions`, `intersect_intervals`, `utterance_regions`, and
+  `overlap_regions` implement the
+  [protocol's timing rules](../evaluation-protocol.md#utterance-identification).
+  Overlap starts from raw intersections, and filtering precedes padding.
+  `SpeechRegion.active_samples` excludes gaps and padding. Assumption: when a
+  recording cannot supply a 0.5-second overlap span, retain the unpadded region
+  as a candidate. Stage 4 must mark its short span ineligible when constructing
+  interval metric results, preserving reporting coverage rather than silently
+  dropping the candidate. No result-schema change is needed.
+- `activity_mask` accumulates raw activity by frame without allocating a
+  sample-sized mask. `activity_counts` returns the shared `ActivityCounts`
+  contract, including true-negative frames in the frame total. Frame masks
+  preserve sub-utterance speech and exclude merged silence and overlap padding.
+  Duration constants derive from the evaluation sample rate. Frame counts use
+  `math.ceil`, with the actual final-frame span retained for majority decisions.
+  Primary transformations use separate assignments, now required by
+  [AGENTS.md](../../AGENTS.md#code-and-checks).
+- `prepare_reference` constructs reusable `ReferenceSpeech` timing and read-only
+  activity masks for both reference channels. `prepare_separation` runs VAD only
+  on present output channels and returns initial T/R `ChannelResult` records
+  with VAD, utterances, and activity populated. Target-only outputs keep residual
+  reference timing with unavailable residual activity. Other metrics remain
+  disabled for Stage 4 to populate. Reuse is explicit and scoped by the caller
+  to one mixture; there is no persistent or cross-recording cache.
+- Added 38 offline CPU tests for merge/intersection and
+  eligibility boundaries, fragmented overlap, padding, activity counts, fake
+  Silero configuration/model loading, independent channel/recording state,
+  reference reuse across inference variants, target-only output, and errors.
+  The isolated package-import test now includes `vad.py` and still verifies
+  that optional runtimes stay unloaded.
+
+**Checks:** in the `audio` environment on Python 3.12.13,
+`python -m ruff check .`, `python -m ruff format --check .`,
+`python -m pytest` (155 tests after review), and `git diff --check` passed.
+Pytest emitted the existing AnyIO plugin and three audioread deprecation warnings.
+A separate, explicitly run CPU check loaded the installed packaged Silero 6.2.1
+model and processed synthetic one-second and 200-sample silence independently;
+both returned no speech. No downloads, source data, or GPU were used; no checks
+were blocked.
+
+**Deviations:** review removed defensive timestamp validation and duplicate
+Silero state/inference handling. Thread configuration is left to users and
+external libraries. CLI/pipeline wiring, requested-metric selection, and
+recording-level VAD failure reporting remain in Stage 4.
 
 ### Stage 4 — Integrate core metrics and the CLI
 
@@ -528,6 +598,11 @@ and no prompt/parameter leakage. Keep real large-v3-turbo transcription opt-in.
   architecture evaluation links (including `evaluation_protocol.md`), and output
   consumers such as shell scripts and run-eval documentation. Document native
   setup/assets, offline operation, subsets, naming/schema, coverage, and costs.
+- Document user-controlled CPU parallelism in the README, including runtime
+  environment variables such as `OMP_NUM_THREADS` set before launching evaluation.
+  RTSS does not explicitly configure thread counts. Check and describe backend
+  overrides: Silero 6.2.1 itself calls `torch.set_num_threads(1)` during import,
+  so environment variables alone do not override that backend-imposed setting.
 
 **Tests:** extend the Stage 4 CLI fixture to all metric families. Verify multiple
 nested mixtures/inference hashes, core/full selection, target-only output,

@@ -34,6 +34,8 @@
 
 - Prefer small functions and clear interfaces. Use type hints for public functions
   and document audio shapes, units, and error behavior where relevant.
+- Assign results of primary transformations or computations to named variables
+  before passing them to another function; do not nest these calls as arguments.
 - Add dependencies when a feature needs them. Take adavantage of established
   libraries and packages when available, rather than re-inventing routines from scratch.
 - Use comments sparingly - comment only when the code contains non-obvious assumptions
