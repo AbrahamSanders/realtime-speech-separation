@@ -1,7 +1,7 @@
 # Evaluation CLI implementation plan
 
-Status: Stage 1 implemented; CLI integration and metric, VAD, speaker, and ASR
-backends remain planned.
+Status: Stages 1–2 implemented; protocol pipeline integration and metric, VAD,
+speaker, and ASR backends remain planned.
 
 ## Objective and scope
 
@@ -341,6 +341,70 @@ backend version resolution remains in owning stages.
 resampling case, absent enrollment, unreadable/missing audio, invalid waveforms,
 wrong channel counts, and mismatched lengths. Use one nested discovery fixture
 with sidecars, multiple inference suffixes, and filters.
+
+**Implementation notes:**
+
+- Added [`audio.py`](../../src/realtime_speech_separation/evaluation/audio.py).
+  `load_audio_triple` returns an `AudioTriple` with float32 samples at 16 kHz and
+  native sample-rate/channel metadata, or the first `RecordingError` with the
+  offending path and reason. `soundfile.info` retains native metadata and checks
+  channel counts before downmixing. `librosa.load` performs float32 decoding,
+  downmixing, and resampling as shown in the protocol. File errors preserve the
+  decoder's message; librosa waveform-validation errors become recording errors.
+  Unexpected programming errors propagate. Finite output and exact resampled
+  lengths are checked at the loading boundary. Silence is valid; floating-point
+  WAV storage is not enforced. No delay removal, length correction, amplitude normalization, or
+  clipping is applied. Inference already removes delay and final-chunk padding.
+- Assumption: preserve the previous `mono=True` behavior by accepting mono or
+  stereo mixtures and averaging stereo channels. Reject more than two channels
+  for all inputs; references require exactly two. Separations are always `(1, n)`
+  or `(2, n)`, with the first channel assigned to T. Resampling uses librosa's
+  default length convention; equality is tested after resampling, with no extra
+  correction when native rates differ.
+- Discovery remains in [`eval_cli.py`](../../src/realtime_speech_separation/eval_cli.py).
+  A local mixture wrapper delegates include and exclude filtering to recursive
+  `get_audio_files`, retaining the original exclusions (`_enrollment.`,
+  `_separated_`, `_reference.`) across full paths. Filtering retains
+  case-insensitive full-path substring matching, OR semantics, and unstripped
+  terms. Adjacent separation discovery requires a regular audio file with the exact mixture-stem prefix
+  and a nonempty inference suffix; results are sorted. The whole suffix,
+  including underscores, is retained. Sidecars, directories, and nonadjacent
+  outputs are ignored. Shared discovery and inference utilities are unchanged.
+- Assumptions: use the existing supported extensions (`.wav`, `.flac`, `.mp3`,
+  `.opus`), matching extensions without case sensitivity. Stem matching remains
+  case-sensitive. The reference keeps the mixture's extension and sits beside
+  it. Metric, VAD, speaker, and ASR backend assets belong outside the input tree;
+  discovery does not inspect those assets or dataset metadata.
+- The current CLI now uses the triple loader without enrollment loading. It
+  passes only reference T for target-only output to the legacy scoring backend.
+  Invalid triples are logged and skipped, valid triples continue, and invalid
+  input makes the invocation return nonzero. Optional Asteroid/pandas imports
+  were moved into execution so importing discovery and showing CLI help work
+  with base/dev dependencies. Native metadata is available to the future pipeline;
+  persistent source fingerprints, structured invalid-result JSON, configuration
+  checks on reused results, and protocol metrics remain in their owning stages.
+- Tests use temporary synthetic audio only. They cover shapes/channel order,
+  unchanged samples and amplitudes at 16 kHz, differing native rates, PCM input,
+  missing/unreadable files on each side, empty/nonfinite waveforms, unsupported
+  channel counts, silence, and unequal resampled lengths. One nested discovery
+  fixture covers supported extensions, multiple full inference suffixes,
+  sidecars/directories, and filters. CLI tests use fake legacy scoring/reporting
+  dependencies to verify target-only/stereo loading without enrollment and
+  continuation after invalid audio. The isolated package-import test includes
+  audio loading and discovery and checks that optional backends stay unloaded.
+
+**Checks:** in the `audio` environment on Python 3.12.13,
+`python -m ruff check .`, `python -m ruff format --check .`,
+`python -m pytest` (117 tests), and `git diff --check` passed after review.
+Pytest emitted the existing installed AnyIO plugin deprecation warning about
+`CallSpec2` and three audioread standard-library deprecation warnings surfaced by
+`librosa.load` on Python 3.12. No native metric/model or GPU checks are needed for
+this stage; no checks were blocked. No dependencies changed.
+
+**Deviations:** reject `--sample_rate` values other than 16000 now, moving that
+small validation forward from Stage 4 so the current CLI cannot pass an incorrect
+sample rate to scoring after the fixed-rate loader runs. Full pipeline/reporting
+integration remains in Stage 4 and Stage 10.
 
 ### Stage 3 — Add VAD, intervals, and activity
 

@@ -1,40 +1,61 @@
+"""Discover evaluation audio and run the speech separation evaluation CLI."""
+
 import argparse
 import json
 import logging
 import os
+from pathlib import Path
 
-import librosa
 import numpy as np
-import pandas as pd
-from asteroid.metrics import get_metrics
 from tqdm import tqdm
 
-from .utils.data_utils import get_audio_files
+from .evaluation.audio import EVALUATION_SAMPLE_RATE, load_audio_triple
+from .evaluation.types import RecordingError
+from .utils.data_utils import RAW_AUDIO_EXTENSIONS, get_audio_files
 
 logger = logging.getLogger(__name__)
 
 
-def get_enrollment_file(input_file: str) -> str:
-    file_name, ext = os.path.splitext(input_file)
-    return f"{file_name}_enrollment{ext}"
+def get_input_files(input_dir: str, input_filter: str | list[str] | None = None) -> list[str]:
+    """Find mixtures recursively with case-insensitive full-path substring filters.
+
+    Multiple terms use OR semantics. Companion markers are excluded from paths;
+    metric, VAD, speaker, and ASR backend assets belong outside the input tree.
+    """
+    return get_audio_files(
+        input_dir,
+        filter_include=input_filter,
+        filter_exclude=["_enrollment.", "_separated_", "_reference."],
+    )
 
 
 def get_reference_file(input_file: str) -> str:
+    """Return the adjacent reference path with the mixture's extension."""
     file_name, ext = os.path.splitext(input_file)
     return f"{file_name}_reference{ext}"
 
 
 def get_separated_files(input_file: str) -> list[str]:
-    # For input file "1.wav", separated files will be like "1_separated_<inference_args_hash>.wav".
-    # There may be multiple separated files for a single input file. Also, separated files may
-    # use a different extension than the input file.
-    file_base, _ = os.path.splitext(input_file)
-    file_base = os.path.basename(file_base)
-    separated_files = []
-    for f in os.listdir(os.path.dirname(input_file)):
-        if f.startswith(f"{file_base}_separated_"):
-            separated_files.append(os.path.join(os.path.dirname(input_file), f))
-    return separated_files
+    """Find adjacent audio outputs, ignoring sidecars, directories, and empty IDs."""
+    mixture = Path(input_file)
+    prefix = f"{mixture.stem}_separated_"
+    return sorted(
+        str(path)
+        for path in mixture.parent.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in RAW_AUDIO_EXTENSIONS
+        and path.stem.startswith(prefix)
+        and len(path.stem) > len(prefix)
+    )
+
+
+def get_inference_hash(input_file: str, separated_file: str) -> str:
+    """Parse the entire inference suffix relative to the mixture stem."""
+    prefix = f"{Path(input_file).stem}_separated_"
+    stem = Path(separated_file).stem
+    if not stem.startswith(prefix) or len(stem) == len(prefix):
+        raise ValueError(f"Separation {separated_file} does not match mixture {input_file}")
+    return stem[len(prefix) :]
 
 
 def get_results_file(separated_file: str) -> str:
@@ -56,19 +77,20 @@ def write_results(separated_file: str, results: dict):
         json.dump(results, f, indent=4)
 
 
-def run_eval(args: argparse.Namespace) -> None:
-    input_files = get_audio_files(
-        args.input_dir,
-        filter_include=args.input_filter,
-        filter_exclude=["_enrollment.", "_separated_", "_reference."],
-    )
+def run_eval(args: argparse.Namespace) -> bool:
+    """Evaluate selected triples; return whether an audio input was invalid."""
+    import pandas as pd
+    from asteroid.metrics import get_metrics
+
+    input_files = get_input_files(args.input_dir, args.input_filter)
+    invalid_input = False
 
     # Perform the evaluation
     inference_args_hash_dict = {}
     for input_file in tqdm(input_files, desc="Processing input files"):
         separated_files = get_separated_files(input_file)
         for sep_file in separated_files:
-            inference_args_hash = os.path.splitext(os.path.basename(sep_file))[0].split("_")[-1]
+            inference_args_hash = get_inference_hash(input_file, sep_file)
 
             # Check if results already exist for this separation and load them if available. Otherwise proceed to compute the metrics
             results = read_results_if_exist(sep_file)
@@ -79,26 +101,18 @@ def run_eval(args: argparse.Namespace) -> None:
             else:
                 logger.info(f"Processing separation {inference_args_hash} of input audio {input_file}.")
 
-                # Load the input, enrollment, reference, and separated audio files
-                input_audio, _ = librosa.load(input_file, sr=args.sample_rate, mono=True, dtype=np.float32)
-                enrollment_audio, _ = librosa.load(
-                    get_enrollment_file(input_file),
-                    sr=args.sample_rate,
-                    mono=True,
-                    dtype=np.float32,
-                )
-                reference_audio, _ = librosa.load(
-                    get_reference_file(input_file),
-                    sr=args.sample_rate,
-                    mono=False,
-                    dtype=np.float32,
-                )
-                separated_audio, _ = librosa.load(sep_file, sr=args.sample_rate, mono=False, dtype=np.float32)
+                # Validate the supplied triple without enrollment or delay correction.
+                audio = load_audio_triple(input_file, get_reference_file(input_file), sep_file)
+                if isinstance(audio, RecordingError):
+                    logger.error("Invalid audio %s: %s", audio.path, audio.reason)
+                    invalid_input = True
+                    continue
+                separated_audio = audio.separated.samples
 
                 # Compute and write the evaluation metrics for the separated audio
                 results = get_metrics(
-                    mix=input_audio,
-                    clean=reference_audio,
+                    mix=audio.mixture.samples,
+                    clean=audio.reference.samples[: separated_audio.shape[0]],
                     estimate=separated_audio,
                     sample_rate=args.sample_rate,
                     metrics_list=["si_sdr", "stoi"],
@@ -175,6 +189,8 @@ def run_eval(args: argparse.Namespace) -> None:
         df = pd.DataFrame(csv_rows)
         df.to_csv(csv_filename, index=False)
 
+    return invalid_input
+
 
 def main(argv: list[str] | None = None) -> int:
     """Run the Speech Separation Evaluation."""
@@ -186,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         "--input_dir",
         type=str,
         required=True,
-        help="Path to the input directory containing input/enrollment/reference/separated pairs.",
+        help="Path to the input directory containing mixture/reference/separated triples.",
     )
     input_group.add_argument("--input_filter", type=str, nargs="+", help="Filter for input files.")
     input_group.add_argument(
@@ -218,14 +234,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.sample_rate != EVALUATION_SAMPLE_RATE:
+        parser.error("The evaluation protocol requires --sample_rate=16000")
 
     log_level = logging.getLevelNamesMapping().get(args.log_level.upper())
     logging.basicConfig(level=log_level)
     logger.info(f"Running with args: {args}")
 
-    run_eval(args)
-
-    return 0
+    return 1 if run_eval(args) else 0
 
 
 if __name__ == "__main__":
