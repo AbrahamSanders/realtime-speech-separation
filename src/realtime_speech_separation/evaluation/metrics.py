@@ -3,13 +3,20 @@
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from importlib import import_module
 from importlib.metadata import version
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 
 from .audio import EVALUATION_SAMPLE_RATE
+from .reporting import content_digest
 from .types import IntervalResultStatus
+
+VISQOL_MIN_SPAN_SAMPLES = 2 * EVALUATION_SAMPLE_RATE
+VISQOL_MAX_SPAN_SAMPLES = 9 * EVALUATION_SAMPLE_RATE
+VISQOL_EDGE_PADDING_SAMPLES = EVALUATION_SAMPLE_RATE // 2
 
 
 @dataclass(frozen=True)
@@ -124,13 +131,10 @@ class Pesq:
     errors and nonfinite scores are failed outcomes.
     """
 
-    def __init__(self, call: Callable | None = None) -> None:
-        """Resolve the PESQ function and typed errors; allow injected calls in tests."""
+    def __init__(self) -> None:
+        """Resolve the PESQ wrapper and its typed errors."""
         import pesq
 
-        if call is None:
-            call = pesq.pesq
-        self._call = call
         self._backend = pesq
         self.versions = {"pesq": version("pesq")}
         self.parameters = {"sample_rate": EVALUATION_SAMPLE_RATE, "mode": "wb", "on_error": "raise_exception"}
@@ -139,7 +143,7 @@ class Pesq:
         """Score a reference utterance using the wrapper's typed error mode."""
         backend = self._backend
         try:
-            score = self._call(
+            score = backend.pesq(
                 EVALUATION_SAMPLE_RATE, reference, estimate, mode="wb", on_error=backend.PesqError.RAISE_EXCEPTION
             )
         except backend.BufferTooShortError:
@@ -154,3 +158,71 @@ class Pesq:
                 return MetricScore("failed", reason="nonfinite_score")
             raise
         return finite_score(score)
+
+
+class Visqol:
+    """Official ViSQOL speech-mode MOS-LQO for aligned mono float32 slices.
+
+    Spans under two seconds are ineligible. Eligible inputs use up to nine
+    seconds of the utterance and half a second of silence at each edge. Native
+    scoring errors and nonfinite scores are failed outcomes.
+    """
+
+    def __init__(self) -> None:
+        """Load the installed CPU binding and its bundled speech model once."""
+        try:
+            from visqol import visqol_lib_py
+            from visqol.pb2 import visqol_config_pb2
+
+            # Register the result protobuf and retrieve the status type installed by the extension.
+            import_module("visqol.pb2.similarity_result_pb2")
+            self._status_error = import_module("pybind11_abseil.status").StatusNotOk
+        except (ImportError, TypeError, RuntimeError) as exc:
+            raise RuntimeError(f"Install the official ViSQOL Python API. See the README's ViSQOL setup. {exc}") from exc
+
+        extension = Path(visqol_lib_py.__file__)
+        model_name = Path(visqol_lib_py.DefaultSpeechModelFile()).name
+        model_path = extension.parent / "model" / model_name
+        self.model_digest = content_digest(model_path)
+        self.versions = {name: version(name) for name in ("visqol", "protobuf")}
+        self.parameters = {
+            "sample_rate": EVALUATION_SAMPLE_RATE,
+            "mode": "speech",
+            "use_lattice_model": True,
+            "search_window_radius": 60,
+            "min_span_samples": VISQOL_MIN_SPAN_SAMPLES,
+            "max_span_samples": VISQOL_MAX_SPAN_SAMPLES,
+            "edge_padding_samples": VISQOL_EDGE_PADDING_SAMPLES,
+            "dtype": "float64",
+            "extension_sha256": content_digest(extension),
+        }
+        config = visqol_config_pb2.VisqolConfig()
+        config.audio.sample_rate = EVALUATION_SAMPLE_RATE
+        config.options.use_speech_scoring = True
+        config.options.use_lattice_model = True
+        config.options.svr_model_path = str(model_path)
+        config.options.search_window_radius = self.parameters["search_window_radius"]
+        self._api = visqol_lib_py.VisqolApi()
+        try:
+            self._api.Create(config)
+        except self._status_error as exc:
+            raise RuntimeError(f"ViSQOL could not initialize its speech model: {exc}") from exc
+        except TypeError as exc:
+            raise RuntimeError(
+                "ViSQOL could not read its configuration. See the README for compatible protobuf versions."
+            ) from exc
+
+    def __call__(self, reference: NDArray[np.float32], estimate: NDArray[np.float32]) -> MetricScore:
+        """Score the same padded utterance prefix in both signals, reference first."""
+        if reference.size < VISQOL_MIN_SPAN_SAMPLES:
+            return MetricScore("ineligible", reason="visqol_buffer_too_short")
+        # Trim both signals at the same sample and put identical silence around them.
+        reference_prefix = np.ascontiguousarray(reference[:VISQOL_MAX_SPAN_SAMPLES], dtype=np.float64)
+        estimate_prefix = np.ascontiguousarray(estimate[:VISQOL_MAX_SPAN_SAMPLES], dtype=np.float64)
+        padded_reference = np.pad(reference_prefix, VISQOL_EDGE_PADDING_SAMPLES)
+        padded_estimate = np.pad(estimate_prefix, VISQOL_EDGE_PADDING_SAMPLES)
+        try:
+            result = self._api.Measure(padded_reference, padded_estimate)
+        except (self._status_error, RuntimeError, IndexError) as exc:
+            return MetricScore("failed", reason=f"visqol_backend_error: {exc}")
+        return finite_score(result.moslqo)

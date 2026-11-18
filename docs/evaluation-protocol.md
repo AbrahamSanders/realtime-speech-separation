@@ -219,6 +219,13 @@ Use wideband PESQ at 16 kHz and report its MOS-LQO score. Record short buffers
 and reference utterances where PESQ detects no usable speech as ineligible
 intervals, with a reason for each exclusion.
 
+Use ViSQOL in 16 kHz speech mode with the speech lattice model and report its
+MOS-LQO score. Reference utterance spans shorter than two seconds are ineligible.
+For eligible spans, take at most the first nine seconds at identical bounds in
+the reference and separated signals. Add 0.5 seconds of silence to each end of
+both signals, yielding inputs of three to ten seconds. Report candidates at their
+original reference utterance bounds.
+
 We measure:
 
 1. Target PESQ, STOI, ViSQOL: Scores between the Separated and Reference T channel for each reference T channel utterance.

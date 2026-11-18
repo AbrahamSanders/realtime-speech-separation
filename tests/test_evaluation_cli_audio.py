@@ -21,7 +21,9 @@ from realtime_speech_separation.evaluation.vad import VadBackendError
 @pytest.fixture
 def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Inject resources at their preflight boundary, exercising the rest of the CLI."""
-    state = SimpleNamespace(loads=Counter(), vad_calls=[], scores=[], metric_failure=False, vad_failure=None)
+    state = SimpleNamespace(
+        loads=Counter(), vad_calls=[], scores=[], metric_failure=False, vad_failure=None, visqol_model_digest="model-a"
+    )
 
     class Detector:
         """Return distinct reference T/R timing and matching output timing."""
@@ -60,12 +62,15 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
         score.versions = {family: "test"}
         score.parameters = {"test": True}
+        if family == "visqol":
+            score.model_digest = state.visqol_model_digest
         return score
 
     monkeypatch.setattr(pipeline, "SileroVad", Detector)
     monkeypatch.setattr(pipeline, "SiSdr", lambda: adapter_factory("si_sdr"))
     monkeypatch.setattr(pipeline, "Stoi", lambda: adapter_factory("stoi"))
     monkeypatch.setattr(pipeline, "Pesq", lambda: adapter_factory("pesq"))
+    monkeypatch.setattr(pipeline, "Visqol", lambda: adapter_factory("visqol"))
     return state
 
 
@@ -246,16 +251,17 @@ def test_cli_continues_after_invalid_audio(tmp_path, core_runtime, caplog) -> No
 
 
 @pytest.mark.parametrize("channels", [1, 2])
-def test_cli_selects_pesq_and_reports_absolute_reference_utterance_scores(tmp_path, core_runtime, channels) -> None:
+@pytest.mark.parametrize("name", ["pesq", "visqol"])
+def test_cli_reports_absolute_reference_utterance_scores(tmp_path, core_runtime, channels, name) -> None:
     """Score only the selected family, with matching reference and output bounds."""
     write_triple(tmp_path, channels=channels)
-    assert main(["--input_dir", str(tmp_path), "--metrics", "pesq"]) == 0
-    assert core_runtime.loads == {"vad": 1, "pesq": 1}
+    assert main(["--input_dir", str(tmp_path), "--metrics", name]) == 0
+    assert core_runtime.loads == {"vad": 1, name: 1}
     (record,) = results_in(tmp_path)
-    assert record.configuration.metrics == ("pesq",)
-    assert record.configuration.metric_backend_versions["pesq"] == "test"
+    assert record.configuration.metrics == (name,)
+    assert record.configuration.metric_backend_versions[name] == "test"
     for channel, interval, value in (("T", Interval(0, 10000), 31), ("R", Interval(6000, 16000), 42.825)):
-        metric = record.channels[channel].metrics["pesq"]
+        metric = record.channels[channel].metrics[name]
         if channel not in record.output_channels:
             assert metric.status == "unavailable"
             assert not metric.interval_results
@@ -268,14 +274,30 @@ def test_cli_selects_pesq_and_reports_absolute_reference_utterance_scores(tmp_pa
     assert len(core_runtime.scores) == channels
     (summary_file,) = tmp_path.glob("summary_*.json")
     summary = json.loads(summary_file.read_text())
-    assert summary["channels"]["T"]["metrics"]["pesq"]["distribution"]["mean"] == 31
+    assert summary["channels"]["T"]["metrics"][name]["distribution"]["mean"] == 31
     (csv_file,) = tmp_path.glob("metrics_*.csv")
     with csv_file.open(newline="") as stream:
         (row,) = csv.DictReader(stream)
-    assert row["T_pesq_mean"] == "31.0"
+    assert row[f"T_{name}_mean"] == "31.0"
 
 
-@pytest.mark.parametrize("selection", [[], ["--metrics", "all"], ["--metrics", "visqol"], ["--metrics", "core", "wer"]])
+def test_visqol_model_digest_controls_result_reuse(tmp_path, core_runtime) -> None:
+    """The same local model reuses results and different model bytes change the evaluation ID."""
+    write_triple(tmp_path, channels=1)
+    args = ["--input_dir", str(tmp_path), "--metrics", "visqol"]
+    assert main(args) == main(args) == 0
+    assert len(core_runtime.scores) == 1
+    core_runtime.visqol_model_digest = "model-b"
+    assert main(args) == 0
+    assert len(core_runtime.scores) == 2
+    records = results_in(tmp_path)
+    assert len({record.evaluation_id for record in records}) == 2
+    assert {record.configuration.model_digests["visqol_speech.tflite"] for record in records} == {"model-a", "model-b"}
+
+
+@pytest.mark.parametrize(
+    "selection", [[], ["--metrics", "all"], ["--metrics", "dnsmos_p808"], ["--metrics", "core", "wer"]]
+)
 def test_unimplemented_selections_fail_before_preflight(tmp_path, core_runtime, selection, caplog) -> None:
     """All remains the full protocol and cannot silently fall back to core."""
     assert main(["--input_dir", str(tmp_path), *selection]) == 1

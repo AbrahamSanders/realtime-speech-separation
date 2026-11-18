@@ -32,7 +32,7 @@ def test_import_outside_repository(tmp_path: Path) -> None:
             "import realtime_speech_separation.evaluation.pipeline; "
             "import realtime_speech_separation.eval_cli; "
             "assert not {'torch', 'transformers', 'codec_bpe', 'llama_cpp', "
-            "'asteroid', 'gradio', 'silero_vad', 'torchmetrics', 'pystoi', 'pesq', "
+            "'asteroid', 'gradio', 'silero_vad', 'torchmetrics', 'pystoi', 'pesq', 'visqol', "
             "'onnxruntime', 'torchaudio', 'pywhispercpp', 'jiwer'} & sys.modules.keys(); "
             "print(json.dumps(realtime_speech_separation.__version__))",
         ],

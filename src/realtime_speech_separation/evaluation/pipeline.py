@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .audio import AudioTriple, load_audio_triple
-from .metrics import MetricScore, Pesq, SiSdr, Stoi, centered_zero_energy
+from .metrics import MetricScore, Pesq, SiSdr, Stoi, Visqol, centered_zero_energy
 from .reporting import compatible_result, content_digest, evaluation_identity, result_path, write_result
 from .types import (
     ALL_METRICS,
@@ -46,7 +46,14 @@ from .vad import (
 
 logger = logging.getLogger(__name__)
 CORE_METRICS: tuple[Metric, ...] = ("si_sdri", "overlap_si_sdri", "activity", "stoi", "stoii")
-METRIC_FAMILIES = {"si_sdri": "si_sdr", "overlap_si_sdri": "si_sdr", "stoi": "stoi", "stoii": "stoi", "pesq": "pesq"}
+METRIC_FAMILIES = {
+    "si_sdri": "si_sdr",
+    "overlap_si_sdri": "si_sdr",
+    "stoi": "stoi",
+    "stoii": "stoi",
+    "pesq": "pesq",
+    "visqol": "visqol",
+}
 MetricCall = Callable[[NDArray[np.float32], NDArray[np.float32]], MetricScore]
 
 
@@ -84,7 +91,7 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
     # Import and initialize only requested metric families, before any output writes.
     try:
         families = {METRIC_FAMILIES[name] for name in metrics if name in METRIC_FAMILIES}
-        factories = {"si_sdr": SiSdr, "stoi": Stoi, "pesq": Pesq}
+        factories = {"si_sdr": SiSdr, "stoi": Stoi, "pesq": Pesq, "visqol": Visqol}
         for family in sorted(families):
             adapters[family] = factories[family]()
         detector = SileroVad()
@@ -94,6 +101,9 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
     versions["torch"] = str(detector.torch_version)
     for adapter in adapters.values():
         versions.update(adapter.versions)
+    model_digests = {"silero_vad.jit": detector.model_digest}
+    if "visqol" in adapters:
+        model_digests["visqol_speech.tflite"] = adapters["visqol"].model_digest
     configuration = EvaluationConfig(
         metrics=metrics,
         parameters={
@@ -111,7 +121,7 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
         },
         metric_backend_versions=versions,
         vad_backend_version=detector.backend_version,
-        model_digests={"silero_vad.jit": detector.model_digest},
+        model_digests=model_digests,
     )
     return EvaluationPipeline(input_dir, configuration, detector, adapters)
 

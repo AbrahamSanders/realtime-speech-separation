@@ -3,6 +3,8 @@
 import os
 import sys
 import warnings
+from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -130,19 +132,16 @@ def fake_pesq(monkeypatch: pytest.MonkeyPatch, fake_runtime: None) -> SimpleName
     return backend
 
 
-@pytest.mark.parametrize("inject_call", [False, True])
-def test_pesq_wideband_arguments_and_provenance(fake_pesq: SimpleNamespace, inject_call: bool) -> None:
+def test_pesq_wideband_arguments_and_provenance(fake_pesq: SimpleNamespace) -> None:
     """Pass unmodified mono waveform slices to the wideband exception-mode API."""
     reference = np.linspace(-1, 1, 8000, dtype=np.float32)
     estimate = reference[::-1]
-    call = Mock(return_value=np.float32(3.25)) if inject_call else fake_pesq.pesq
-    adapter = metrics.Pesq(call if inject_call else None)
+    adapter = metrics.Pesq()
     assert adapter(reference, estimate) == metrics.MetricScore("scored", 3.25)
+    call = fake_pesq.pesq
     sample_rate, ref_arg, est_arg = call.call_args.args
     assert sample_rate == 16000 and ref_arg is reference and est_arg is estimate
     assert call.call_args.kwargs == {"mode": "wb", "on_error": fake_pesq.PesqError.RAISE_EXCEPTION}
-    if inject_call:
-        fake_pesq.pesq.assert_not_called()
     assert adapter.parameters == {"sample_rate": 16000, "mode": "wb", "on_error": "raise_exception"}
     assert adapter.versions == {"pesq": "test"}
 
@@ -174,6 +173,91 @@ def test_pesq_nonfinite_scores_and_unexpected_errors(fake_pesq: SimpleNamespace)
     assert adapter(samples, samples) == failed
     fake_pesq.pesq.side_effect = ValueError("unexpected error")
     with pytest.raises(ValueError, match="unexpected error"):
+        adapter(samples, samples)
+
+
+@pytest.fixture
+def fake_visqol(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_runtime: None) -> SimpleNamespace:
+    """Stand in for the official binding, generated protobufs, and local assets."""
+
+    class StatusNotOk(Exception):
+        """Match the native binding's Abseil status exception."""
+
+    model_path = tmp_path / "model" / "speech.tflite"
+    model_path.parent.mkdir()
+    model_path.write_bytes(b"speech lattice model")
+    extension = tmp_path / "visqol_lib_py.so"
+    extension.write_bytes(b"native library")
+    api = SimpleNamespace(Create=Mock(), Measure=Mock(return_value=SimpleNamespace(moslqo=3.5)))
+    config = SimpleNamespace(audio=SimpleNamespace(), options=SimpleNamespace())
+    native = SimpleNamespace(
+        __file__=str(extension), DefaultSpeechModelFile=lambda: "/model/speech.tflite", VisqolApi=Mock(return_value=api)
+    )
+    protobuf = SimpleNamespace(VisqolConfig=Mock(return_value=config))
+    monkeypatch.setitem(sys.modules, "visqol", SimpleNamespace(visqol_lib_py=native))
+    monkeypatch.setitem(sys.modules, "visqol.pb2", SimpleNamespace(visqol_config_pb2=protobuf))
+    monkeypatch.setitem(sys.modules, "visqol.pb2.similarity_result_pb2", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "pybind11_abseil.status", SimpleNamespace(StatusNotOk=StatusNotOk))
+    return SimpleNamespace(api=api, config=config, model_path=model_path, extension=extension, status_error=StatusNotOk)
+
+
+def test_visqol_speech_configuration(fake_visqol: SimpleNamespace) -> None:
+    """Use the packaged lattice model and record the entire input policy."""
+    adapter = metrics.Visqol()
+    config = fake_visqol.config
+    fake_visqol.api.Create.assert_called_once_with(config)
+    assert config.audio.sample_rate == 16000
+    assert config.options.use_speech_scoring is config.options.use_lattice_model is True
+    assert config.options.search_window_radius == 60
+    assert config.options.svr_model_path == str(fake_visqol.model_path)
+    assert adapter.model_digest == sha256(fake_visqol.model_path.read_bytes()).hexdigest()
+    assert adapter.parameters["extension_sha256"] == sha256(fake_visqol.extension.read_bytes()).hexdigest()
+    assert adapter.versions == {"visqol": "test", "protobuf": "test"}
+    assert adapter.parameters["min_span_samples"] == 32000
+    assert adapter.parameters["max_span_samples"] == 144000
+    assert adapter.parameters["edge_padding_samples"] == 8000
+
+
+@pytest.mark.parametrize(("size", "scored_samples"), [(32000, 32000), (144000, 144000), (160000, 144000)])
+def test_visqol_trims_and_pads_aligned_inputs(fake_visqol: SimpleNamespace, size: int, scored_samples: int) -> None:
+    """Score the same prefix in both signals and add exactly half a second at each edge."""
+    adapter = metrics.Visqol()
+    reference = np.linspace(-1, 1, size, dtype=np.float32)
+    estimate = reference[::-1]
+    short = metrics.MetricScore("ineligible", reason="visqol_buffer_too_short")
+    assert adapter(reference[:31999], estimate[:31999]) == short
+    fake_visqol.api.Measure.assert_not_called()
+    assert adapter(reference, estimate) == metrics.MetricScore("scored", 3.5)
+    ref_arg, est_arg = fake_visqol.api.Measure.call_args.args
+    for padded, original in ((ref_arg, reference), (est_arg, estimate)):
+        assert padded.size == scored_samples + 16000
+        np.testing.assert_array_equal(padded[8000:-8000], original[:scored_samples])
+        assert not np.any(padded[:8000]) and not np.any(padded[-8000:])
+        assert padded.dtype == np.float64 and padded.flags.c_contiguous
+
+
+def test_visqol_native_failures_and_nonfinite_scores(fake_visqol: SimpleNamespace) -> None:
+    """Fail preflight for model loading errors and isolate failures during scoring."""
+    fake_visqol.api.Create.side_effect = fake_visqol.status_error("invalid model")
+    with pytest.raises(RuntimeError, match="ViSQOL could not initialize.*invalid model"):
+        metrics.Visqol()
+    fake_visqol.api.Create.side_effect = TypeError("incompatible function arguments")
+    with pytest.raises(RuntimeError, match="compatible protobuf versions"):
+        metrics.Visqol()
+    fake_visqol.api.Create.side_effect = None
+    adapter = metrics.Visqol()
+    samples = np.ones(32000, dtype=np.float32)
+    fake_visqol.api.Measure.return_value = SimpleNamespace(moslqo=np.nan)
+    assert adapter(samples, samples) == metrics.MetricScore("failed", reason="nonfinite_score")
+    for error in (
+        fake_visqol.status_error("scoring failed"),
+        RuntimeError("scoring failed"),
+        IndexError("scoring failed"),
+    ):
+        fake_visqol.api.Measure.side_effect = error
+        assert adapter(samples, samples) == metrics.MetricScore("failed", reason="visqol_backend_error: scoring failed")
+    fake_visqol.api.Measure.side_effect = TypeError("unexpected bug")
+    with pytest.raises(TypeError, match="unexpected bug"):
         adapter(samples, samples)
 
 
@@ -228,3 +312,29 @@ def test_real_pesq_scores_signal_and_reports_native_exceptions() -> None:
     assert adapter(signal[:3200], signal[:3200]) == metrics.MetricScore("ineligible", reason="pesq_buffer_too_short")
     assert adapter(silence, signal) == metrics.MetricScore("ineligible", reason="pesq_no_utterances")
     assert adapter(signal, silence) == metrics.MetricScore("failed", reason="nonfinite_score")
+
+
+@pytest.mark.metric_backend
+@pytest.mark.skipif(os.environ.get("RTSS_TEST_VISQOL") != "1", reason="opt-in installed ViSQOL backend")
+def test_real_visqol_speech_minimum_and_mos_lqo() -> None:
+    """Verify the native minimum and the padded protocol inputs on the real API."""
+    rng = np.random.default_rng(42)
+    time = np.arange(160000) / 16000
+    envelope = 0.4 * (0.65 + 0.35 * np.sin(2 * np.pi * 3 * time))
+    carrier = np.sin(2 * np.pi * 190 * time) + 0.3 * rng.standard_normal(time.size)
+    signal = (envelope * carrier).astype(np.float32)
+    adapter = metrics.Visqol()
+    for size in (8000, 10239):
+        samples = signal[:size]
+        native_samples = samples.astype(np.float64)
+        with pytest.raises(IndexError, match=r"Mat::rows\(\): indices out of bounds"):
+            adapter._api.Measure(native_samples, native_samples)
+    native_boundary = signal[:10240].astype(np.float64)
+    assert 4.0 <= adapter._api.Measure(native_boundary, native_boundary).moslqo <= 5.0
+    too_short = signal[:31999]
+    assert adapter(too_short, too_short) == metrics.MetricScore("ineligible", reason="visqol_buffer_too_short")
+    for size in (32000, 144000, 160000):
+        samples = signal[:size]
+        score = adapter(samples, samples)
+        assert score.status == "scored"
+        assert 4.0 <= score.value <= 5.0

@@ -1,7 +1,6 @@
 # Evaluation CLI implementation plan
 
-Stages 1–5 are implemented. ViSQOL, DNSMOS, speaker, and ASR backends remain
-planned.
+Stages 1–6 are implemented. DNSMOS, speaker, and ASR backends remain planned.
 
 ## Objective and scope
 
@@ -653,9 +652,8 @@ An opt-in wrapper smoke test checks a valid signal and documented error cases.
   reference-utterance bounds using 16 kHz wideband mode and
   `PesqError.RAISE_EXCEPTION`. `--metrics core pesq` combines PESQ with core
   metrics. PESQ settings and the installed wrapper version are part of the
-  evaluation ID. The adapter accepts an injected scoring callable for tests and
-  defaults to the native callable. The existing interval reporting and cache
-  rules apply.
+  evaluation ID. Tests substitute the PESQ module, including its scoring function
+  and exception types. The existing interval reporting and cache rules apply.
 - The implementation assumes `BufferTooShortError` and `NoUtterancesError` mean
   the interval is ineligible for PESQ, with reasons `pesq_buffer_too_short` and
   `pesq_no_utterances`. They retain a candidate with a null value. Other typed
@@ -685,13 +683,64 @@ the silent target estimate produced a nonfinite result and a nonzero exit code.
 
 - Initialize the official API in 16 kHz speech mode with a local speech model;
   return per-utterance MOS-LQO and document native setup.
-- Establish the pinned ViSQOL metric backend's actual short-input requirements. Keep protocol
-  utterances; record unsupported ones without adding padding or concatenation.
+- Establish the pinned ViSQOL metric backend's actual short-input requirements.
+  Apply the ViSQOL input duration and padding rules from the
+  [protocol](../evaluation-protocol.md#pesq-stoi-visqol).
 - Investigate the official CLI only if the Python API cannot run in the target
   environment; record that decision before adding a fallback adapter.
 
 **Tests:** verify speech-mode/model configuration with a fake ViSQOL metric backend. Use an
 opt-in smoke test to establish native short-utterance behavior.
+
+**Implementation notes**
+
+- `--metrics visqol` loads the official Python API once on CPU. The adapter
+  passes the aligned, padded reference and separated utterance prefixes as
+  contiguous float64 arrays and records `moslqo`. Assumption: use the official
+  bundled 16 kHz speech lattice model at its installed path. RTSS enables the lattice
+  explicitly and uses the upstream search radius of 60 and native alignment
+  defaults. No runtime download is needed. The evaluation ID includes the
+  binding and Protobuf versions, the extension SHA-256, the speech model
+  SHA-256, and the resolved scoring settings.
+- The evaluation rule uses utterance span duration. Spans under two
+  seconds are `ineligible/visqol_buffer_too_short`. The first nine seconds at
+  most are scored with 0.5 seconds of zero padding at each end of both signals.
+  The padding and span limits are derived from the sample rate and included in
+  the evaluation ID. Results retain the original reference utterance bounds.
+  Native status, runtime, and indexing errors during scoring are interval
+  failures, as are nonfinite scores.
+  [Upstream input guidelines](https://github.com/google/visqol/blob/master/README.md#guidelines)
+- Pinned official revision `38d0b0163e441047d4429bf07ad09e5b9031d02c`, whose
+  installer reports version 3.3.3. The setup uses that revision's Bazel 5.3.2,
+  updates pybind11 to 2.11.2 for Python 3.12, and supplies `<cstdint>` when
+  compiling the pinned TensorFlow Lite source with GCC 13. Protobuf 3.20.3
+  and 5.29.6 worked on Python 3.12. Protobuf 7.34.1 failed configuration because
+  the pinned binding uses `MessageFactory.GetPrototype`, which was removed in
+  version 6. RTSS surfaces configuration failures during preflight. The
+  Python API worked on the target host, so the implementation uses it directly.
+  The local model SHA-256 is
+  `4bd031d6c95594ae2cd1d471aa6611bff26b3bbf816528431ff1741bcd798dc6`.
+  [Upstream installer](https://github.com/google/visqol/blob/38d0b0163e441047d4429bf07ad09e5b9031d02c/setup.py)
+  [Protobuf migration guide](https://protobuf.dev/support/migration/)
+  [Native setup](../../README.md#visqol-setup)
+
+**Checks**
+
+Ruff lint and formatting, `git diff --check`, and pytest passed in the `audio`
+environment (Python 3.12.13, 214 passed, three opt-in tests skipped). All three
+opt-in CPU metric tests passed when explicitly enabled with
+`RTSS_TEST_METRIC_BACKENDS=1`, `RTSS_TEST_VISQOL=1`, and `-m metric_backend`.
+Native build and execution were verified on Linux x86-64 with Python 3.12.13
+and NumPy 2.4.6. Python 3.14 support was added in pybind11 3.0, which is newer
+than the build dependency verified here. The Protobuf 5 runtime emitted the
+expected `MessageFactory` deprecation warning.
+[pybind11 changelog](https://pybind11.readthedocs.io/en/stable/changelog.html)
+
+Boundary tests verify two-second eligibility, the nine-second cap, and the
+exact zero padding in both inputs. On temporary copies of upstream test speech,
+the CLI reported one scored
+utterance and one ineligible utterance with its original 8,464-sample span,
+wrote JSON and CSV, and reused both results on the second run.
 
 ### Stage 7 — Add DNSMOS-P.808
 

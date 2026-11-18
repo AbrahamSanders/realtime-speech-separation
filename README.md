@@ -112,6 +112,42 @@ and NumPy versions, see the
 Select PESQ with `--metrics pesq` or add it to the core metrics with
 `--metrics core pesq`.
 
+#### ViSQOL setup
+
+Select ViSQOL with `--metrics visqol` or add it to a subset with
+`--metrics core visqol`. Evaluation loads the speech lattice model bundled with
+the official Python binding and works offline after installation. ViSQOL scores
+reference utterance spans of at least two seconds. It takes up to the first nine
+seconds and adds half a second of silence to each end of both signals.
+
+Build the binding separately from the `eval` extra. The commands below were
+tested on Linux x86-64 with Python 3.12, GCC 13, and Bazel 5.3.2. Install that
+Bazel version on `PATH` and run from your evaluation environment. The pinned
+binding uses a Protobuf API removed in version 6.
+
+```bash
+python -m pip install 'setuptools>=77' 'protobuf>=3.20.3,<6'
+git clone https://github.com/google/visqol.git
+cd visqol
+git checkout 38d0b0163e441047d4429bf07ad09e5b9031d02c
+
+# Update the upstream pybind11 build dependency for Python 3.12.
+sed -i \
+    -e 's/pybind11-2\.9\.2/pybind11-2.11.2/' \
+    -e 's/v2\.9\.2\.tar\.gz/v2.11.2.tar.gz/' \
+    -e 's/6bd528c4dbe2276635dc787b6b1f2e5316cf6b49ee3e150264e455a0d68d19c1/c38f52f75a4e2af9a5bcff2368713101585acc06963891af5f03eaa7f4c04242/' \
+    WORKSPACE
+
+# Supply the header that the pinned TensorFlow Lite source needs with GCC 13.
+printf '%s\n' 'build --per_file_copt=.*tensorflow/lite/kernels/internal/spectrogram[.]cc@-include,cstdint' >> .bazelrc
+export PYTHON_BIN_PATH="$(command -v python)"
+bazel build -c opt //:similarity_result_py_pb2 //:visqol_config_py_pb2 //python:visqol_lib_py.so
+python -m pip install --no-build-isolation .
+```
+
+The source revision, model checksum, and native test details are in the
+[Stage 6 implementation notes](docs/plans/eval_cli.md#stage-6--add-visqol).
+
 ### Usage Notes
 
 By default, `rtss.separate` and `rtss.eval` will skip any already processed files.
