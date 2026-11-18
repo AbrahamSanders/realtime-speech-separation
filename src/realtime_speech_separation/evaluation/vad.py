@@ -198,12 +198,12 @@ class ChannelSpeech:
 
 @dataclass(frozen=True)
 class ReferenceSpeech:
-    """Reusable reference timing and per-channel errors; never share across mixtures."""
+    """Reusable reference timing; overlap is None if either reference VAD failed."""
 
     sample_count: int
     target: ChannelSpeech
     residual: ChannelSpeech
-    overlap: tuple[SpeechRegion, ...]
+    overlap: tuple[SpeechRegion, ...] | None
 
 
 def _channel_speech(samples: NDArray[np.float32], detector: SpeechDetector) -> ChannelSpeech:
@@ -225,7 +225,7 @@ def prepare_reference(reference: NDArray[np.float32], detector: SpeechDetector) 
     target, residual = (_channel_speech(samples, detector) for samples in reference)
     sample_count = reference.shape[1]
     # Overlap requires both reference populations; a failed channel is not silence.
-    overlap = ()
+    overlap = None
     if target.error is None and residual.error is None:
         overlap = overlap_regions(target.intervals, residual.intervals, sample_count)
     return ReferenceSpeech(sample_count, target, residual, overlap)

@@ -577,6 +577,23 @@ later stages. Cover shared resource preflight and failure isolation once.
   file-I/O, and requested backend failures return nonzero; valid mathematical
   unavailability does not. The legacy rate flag only accepts 16000 and permutation
   matching is rejected.
+- Added explicit failed `MetricResult` outcomes for missing VAD prerequisites.
+  Both in-memory and persisted overlap use `None` for reference VAD failure
+  and an empty tuple for successful VAD without overlap. Each channel/metric summary now includes
+  `recording_coverage`: `candidate_recordings`, `scored_recordings`,
+  `no_candidate_recordings`, `excluded_due_to_errors`,
+  `partially_failed_recordings`, and `exclusion_reasons`. Activity and WER expose
+  the same recording accounting. All-interval failures count as full error
+  exclusions; partial failures retain surviving scores. Reason codes exclude
+  runtime detail after `: ` and count each excluded recording once per distinct
+  reason. Disabled/missing outputs do not contribute candidates; invalid inputs
+  remain in the separate recording totals. Recording coverage stays in summary
+  JSON; CSV rows retain interval/frame/word coverage and metric-level failure
+  reasons without per-recording binary coverage fields. Future adapters must mark failed
+  prerequisites explicitly rather than fabricate empty candidate populations.
+  Tests cover all nine reference/output T/R VAD failure combinations, successful
+  empty populations, undefined scores, full/partial interval errors, missing
+  outputs, failed-result round trips/reuse, and activity/ASR exclusion reasons.
 - Naming assumption: each directory has unique mixture stems and each mixture
   has at most one separated audio file per inference suffix, regardless of
   extension. Ambiguities are rejected to prevent result-file collisions. Result
@@ -602,7 +619,7 @@ later stages. Cover shared resource preflight and failure isolation once.
 
 **Checks:** in the `audio` environment on Python 3.12.13,
 `python -m ruff check .`, `python -m ruff format --check .`,
-`python -m pytest` (187 passed, one opt-in test skipped), and `git diff --check`
+`python -m pytest` (199 passed, one opt-in test skipped), and `git diff --check`
 passed. The skipped real CPU SI-SDR sanity test passed when explicitly enabled
 with `RTSS_TEST_METRIC_BACKENDS=1` and `-m metric_backend`. A temporary synthetic
 target-only silence triple passed actual-resource core CLI evaluation, strict

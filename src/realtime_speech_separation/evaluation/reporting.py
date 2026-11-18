@@ -158,6 +158,7 @@ def has_failures(result: RecordingResult) -> bool:
         or channel.wer.status == "failed"
         or channel.prototype.status == "failed"
         or any(item.status == "failed" for item in channel.prototype.extractions)
+        or any(metric.status == "failed" for metric in channel.metrics.values())
         or any(item.status == "failed" for metric in channel.metrics.values() for item in metric.interval_results)
         for channel in result.channels.values()
     )
@@ -240,6 +241,7 @@ def _recording_row(result: RecordingResult) -> dict[str, object]:
         for metric, measurements in summary["metrics"].items():
             prefix = f"{name}_{metric}"
             row[f"{prefix}_status"] = channel.metrics[metric].status
+            row[f"{prefix}_reason"] = channel.metrics[metric].reason
             row[f"{prefix}_mean"] = measurements["distribution"]["mean"]
             for key, value in measurements["coverage"].items():
                 if key != "reasons":
@@ -254,7 +256,8 @@ def _recording_row(result: RecordingResult) -> dict[str, object]:
                 if not isinstance(value, dict):
                     row[f"{name}_{metric}_{key}"] = value
             for key, value in summary[metric]["coverage"].items():
-                row[f"{name}_{metric}_{key}"] = value
+                if not key.endswith("recordings") and key != "scored_per_candidate":
+                    row[f"{name}_{metric}_{key}"] = value
     return row
 
 
@@ -355,6 +358,49 @@ def _count_result_coverage(items: Sequence[ActivityResult | WordErrorResult]) ->
     }
 
 
+def _recording_coverage(items: Sequence[MetricResult | ActivityResult | WordErrorResult]) -> dict[str, object]:
+    """Count recording participation separately from interval eligibility.
+
+    Error exclusions have no metric value: prerequisite failures or all candidates
+    failing. Partial interval errors retain the recording's other outcomes. Each
+    excluded recording counts once per distinct reason code, stripping runtime
+    detail after ': '; reason totals can exceed the excluded recording count.
+    Disabled/missing channels and successful empty populations are not errors.
+    """
+    candidates = scored = empty = excluded = partial = 0
+    reasons = Counter()
+    for item in items:
+        if item.status in ("disabled", "unavailable"):
+            continue
+        candidates += 1
+        failures = []
+        if item.status == "failed":
+            failures = [item.reason]
+            excluded += 1
+        elif isinstance(item, MetricResult):
+            intervals = item.interval_results
+            scored += any(result.status == "scored" for result in intervals)
+            empty += not intervals
+            failed_intervals = [result for result in intervals if result.status == "failed"]
+            if failed_intervals and len(failed_intervals) == len(intervals):
+                excluded += 1
+                failures = [result.reason for result in failed_intervals]
+            elif failed_intervals:
+                partial += 1
+        else:
+            scored += item.status == "scored"
+        codes = {reason.split(": ", 1)[0] for reason in failures}
+        reasons.update(codes)
+    return {
+        "candidate_recordings": candidates,
+        "scored_recordings": scored,
+        "no_candidate_recordings": empty,
+        "excluded_due_to_errors": excluded,
+        "partially_failed_recordings": partial,
+        "exclusion_reasons": dict(sorted(reasons.items())),
+    }
+
+
 def _channel_summary(channels: Sequence[ChannelResult], sample_counts: Sequence[int]) -> dict[str, object]:
     """Pool one channel's interval scores and raw counts, preserving partial successes."""
     metrics = {}
@@ -362,7 +408,8 @@ def _channel_summary(channels: Sequence[ChannelResult], sample_counts: Sequence[
         records = [channel.metrics[name] for channel in channels]
         interval_results = [item for record in records for item in record.interval_results]
         metrics[name] = {
-            "recordings_by_status": _status_counts(records, ("enabled", "disabled", "unavailable")),
+            "recordings_by_status": _status_counts(records, ("enabled", "disabled", "unavailable", "failed")),
+            "recording_coverage": _recording_coverage(records),
             "coverage": coverage(interval_results),
             "distribution": distribution([item.value for item in interval_results if item.status == "scored"]),
         }
@@ -383,6 +430,7 @@ def _channel_summary(channels: Sequence[ChannelResult], sample_counts: Sequence[
     )
     activity = {
         "recordings_by_status": _status_counts(activities, ("scored", "disabled", "unavailable", "failed")),
+        "recording_coverage": _recording_coverage(activities),
         "coverage": {
             **_count_result_coverage(activities),
             "candidate_frames": candidate_frames,
@@ -405,6 +453,7 @@ def _channel_summary(channels: Sequence[ChannelResult], sample_counts: Sequence[
     }
     wer = {
         "recordings_by_status": _status_counts(words, ("scored", "disabled", "unavailable", "failed")),
+        "recording_coverage": _recording_coverage(words),
         "coverage": {
             **_count_result_coverage(words),
             "scored_reference_words": edits["reference_words"],

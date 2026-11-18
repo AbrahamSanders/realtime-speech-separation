@@ -210,11 +210,12 @@ class MetricResult:
             enabled: Selected on an available output, even if VAD found no candidates.
             disabled: Not requested.
             unavailable: The output channel is missing.
+            failed: Required preprocessing failed before candidates could be constructed.
         interval_results: Individual candidate successes and errors.
-        reason: Explanation required when the metric is unavailable.
+        reason: Explanation required when the metric is unavailable or failed.
     """
 
-    status: Literal["enabled", "disabled", "unavailable"] = "disabled"
+    status: Literal["enabled", "disabled", "unavailable", "failed"] = "disabled"
     interval_results: tuple[IntervalMetricResult, ...] = ()
     reason: str | None = None
 
@@ -222,8 +223,8 @@ class MetricResult:
         """Keep disabled and unavailable metrics out of candidate populations."""
         if self.status != "enabled" and self.interval_results:
             raise ValueError("Only enabled metrics can contain interval results")
-        if self.status == "unavailable" and not self.reason:
-            raise ValueError("Unavailable metrics require a reason")
+        if self.status in ("unavailable", "failed") and not self.reason:
+            raise ValueError("Unavailable/failed metrics require a reason")
 
 
 @dataclass(frozen=True)
@@ -503,6 +504,8 @@ class RecordingResult:
                 failing before candidate regions could be constructed.
         error: Loading or validation failure required for invalid recordings; otherwise None.
         reference_overlap: Reference overlap regions after merging, filtering, and padding.
+            None means reference VAD failed; () means successful VAD found no
+            qualifying overlap.
         output_channels: Read-only tuple of available separated channels in T/R order,
             derived from channel availability and omitted from JSON.
     """
@@ -515,7 +518,7 @@ class RecordingResult:
     channels: dict[Channel, ChannelResult]
     status: Literal["processed", "invalid", "failed"] = "processed"
     error: RecordingError | None = None
-    reference_overlap: tuple[SpeechRegion, ...] = ()
+    reference_overlap: tuple[SpeechRegion, ...] | None = ()
 
     @property
     def output_channels(self) -> tuple[Channel, ...]:

@@ -262,7 +262,7 @@ class EvaluationPipeline:
         channel: Channel,
         index: int,
         prepared: ChannelResult,
-        reference_overlap: tuple[SpeechRegion, ...],
+        reference_overlap: tuple[SpeechRegion, ...] | None,
         baselines: dict[tuple[str, Channel, Interval], MetricScore],
     ) -> ChannelResult:
         """Slice identical bounds without permutation and pool no recording means."""
@@ -274,6 +274,13 @@ class EvaluationPipeline:
                 continue
             if prepared.status == "unavailable":
                 metrics[name] = MetricResult("unavailable", reason="missing_output_channel")
+                continue
+            # Unknown populations are failures, distinct from successful VAD with no speech.
+            if name == "overlap_si_sdri" and reference_overlap is None:
+                metrics[name] = MetricResult("failed", reason="reference_overlap_vad_error")
+                continue
+            if name != "overlap_si_sdri" and prepared.reference_vad_error is not None:
+                metrics[name] = MetricResult("failed", reason="reference_vad_error")
                 continue
             family = METRIC_FAMILIES[name]
             regions = reference_overlap if name == "overlap_si_sdri" else prepared.reference_utterances

@@ -663,3 +663,71 @@ def test_grouping_selection_and_cached_result_provenance() -> None:
 def test_record_invariants_fail_early(make_invalid) -> None:
     with pytest.raises(ValueError):
         make_invalid()
+
+
+def test_recording_error_exclusions_distinguish_partial_empty_and_undefined() -> None:
+    """Count entire exclusions once without discarding partial scores or valid empty VAD."""
+    config = EvaluationConfig(metrics=("stoi",))
+    interval_failure = IntervalMetricResult(
+        Interval(0, 8000), "reference_utterance", "failed", reason="backend_error: detail"
+    )
+    second_failure = replace(interval_failure, interval=Interval(8000, 16000))
+    undefined = IntervalMetricResult(Interval(0, 8000), "reference_utterance", "undefined", reason="undefined_signal")
+    outcomes = (
+        MetricResult("enabled", (scored(0),)),
+        MetricResult("enabled"),
+        MetricResult("failed", reason="reference_vad_error"),
+        MetricResult("enabled", (interval_failure, second_failure)),
+        MetricResult("enabled", (interval_failure, scored(0.8, Interval(8000, 16000)))),
+        MetricResult("enabled", (undefined,)),
+    )
+    records = []
+    for index, outcome in enumerate(outcomes):
+        target = channel_result(config)
+        target = replace(target, metrics={**target.metrics, "stoi": outcome})
+        records.append(recording(str(index), configuration=config, target=target, target_only=True))
+    result = summary(*records)
+    target = result["channels"]["T"]["metrics"]["stoi"]
+    assert target["recording_coverage"] == {
+        "candidate_recordings": 6,
+        "scored_recordings": 2,
+        "no_candidate_recordings": 1,
+        "excluded_due_to_errors": 2,
+        "partially_failed_recordings": 1,
+        "exclusion_reasons": {"backend_error": 1, "reference_vad_error": 1},
+    }
+    assert target["distribution"]["mean"] == 0.4
+    assert result["channels"]["R"]["metrics"]["stoi"]["recording_coverage"]["candidate_recordings"] == 0
+    failed = records[2]
+    assert parse_result(strict_json_dumps(failed)) == failed
+    assert (
+        compatible_result(
+            strict_json_dumps(failed),
+            configuration=config,
+            inference_hash=failed.inference_hash,
+            sources=failed.sources,
+        )
+        is None
+    )
+
+
+def test_count_measurement_error_exclusions() -> None:
+    """Activity/ASR execution failures have recording exclusion reasons too."""
+    config = EvaluationConfig(metrics=("activity", "wer"))
+    target = channel_result(
+        config,
+        activity=ActivityResult("failed", reason="reference_vad_backend_error: runtime details"),
+        wer=WordErrorResult("failed", reason="asr_backend_error: runtime details"),
+    )
+    result = summary(recording(configuration=config, target=target, residual=target))["channels"]["T"]
+    for metric, reason in (("activity", "reference_vad_backend_error"), ("wer", "asr_backend_error")):
+        assert result[metric]["recording_coverage"]["excluded_due_to_errors"] == 1
+        assert result[metric]["recording_coverage"]["exclusion_reasons"] == {reason: 1}
+
+
+def test_failed_metric_contract() -> None:
+    """Preprocessing failures need reasons and cannot fabricate interval candidates."""
+    with pytest.raises(ValueError, match="reason"):
+        MetricResult("failed")
+    with pytest.raises(ValueError, match="Only enabled"):
+        MetricResult("failed", (scored(1),), reason="reference_vad_error")

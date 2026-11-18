@@ -97,7 +97,9 @@ one row per separation. Dataset-filtered reports coexist with full-set reports.
 Results are reused only when the source content and configuration match and no
 VAD, metric, speaker, or ASR backend failed. Invalid inputs and failures in any
 of these backends return a nonzero exit status. Undefined scores and ineligible
-intervals retain explicit reasons and coverage.
+intervals retain explicit reasons and coverage. Each channel measurement also
+reports recording participation and error exclusions with reason counts; partial
+interval failures preserve the remaining scores.
 
 ### Usage Notes
 

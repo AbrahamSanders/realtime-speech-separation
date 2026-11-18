@@ -124,6 +124,17 @@ def test_cli_loads_and_scores_triple_without_enrollment(tmp_path, core_runtime, 
     assert len(rows) == 1
     assert rows[0]["T_stoi_status"] == "enabled"
     assert rows[0]["T_activity_tp"] == "6"
+    recording_counts = (
+        "candidate_recordings",
+        "scored_recordings",
+        "no_candidate_recordings",
+        "excluded_due_to_errors",
+        "partially_failed_recordings",
+        "empty_reference_recordings",
+    )
+    assert not any(column.endswith(recording_counts) for column in rows[0])
+    assert "T_activity_candidate_frames" in rows[0]
+    assert "T_stoi_candidates" in rows[0]
 
 
 def test_cli_reuses_reference_baselines_and_cached_results(tmp_path, core_runtime) -> None:
@@ -309,6 +320,8 @@ def test_no_speech_and_all_invalid_reports(tmp_path, core_runtime) -> None:
     assert summary["channels"]["T"]["metrics"]["si_sdri"]["distribution"]["mean"] is None
     assert summary["channels"]["T"]["activity"]["precision"] is None
     assert not core_runtime.scores
+    (record,) = results_in(tmp_path)
+    assert record.reference_overlap == ()
     (tmp_path / "call_name_reference.wav").unlink()
     assert main(args) == 1
     summary = json.loads(summary_file.read_text())
@@ -365,7 +378,7 @@ def test_reference_vad_failure_preserves_independent_populations(tmp_path, core_
         assert failed.activity.status == "failed"
         assert healthy.activity.status == "scored"
         assert healthy.metrics["stoi"].interval_results[0].status == "scored"
-        assert record.reference_overlap == ()
+        assert record.reference_overlap is None
         assert record.status == "failed"
 
 
@@ -391,3 +404,46 @@ def test_both_vad_errors_survive_disabled_activity(tmp_path, core_runtime) -> No
     assert core_runtime.vad_calls == [1, 2, 3, 4]
     assert record.channels["R"].separated_utterances
     assert record.channels["R"].metrics["stoi"].interval_results[0].status == "scored"
+
+
+@pytest.mark.parametrize(
+    ("failures", "utterance_channels", "overlap_available", "activity_channels"),
+    [
+        ((2,), "T", False, "T"),
+        ((1,), "R", False, "R"),
+        ((1, 2), "", False, ""),
+        ((4,), "TR", True, "T"),
+        ((3,), "TR", True, "R"),
+        ((3, 4), "TR", True, ""),
+        ((2, 4), "T", False, "T"),
+        ((1, 3), "R", False, "R"),
+        ((1, 2, 3, 4), "", False, ""),
+    ],
+)
+def test_summary_measurement_exclusions_for_vad_failures(
+    tmp_path, core_runtime, failures, utterance_channels, overlap_available, activity_channels
+) -> None:
+    """All nine failure combinations preserve independent participation and exclusions."""
+    write_triple(tmp_path)
+    core_runtime.vad_failure = failures
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core"]) == 1
+    (summary_path,) = tmp_path.glob("summary_*.json")
+    summary = json.loads(summary_path.read_text())
+    (record,) = results_in(tmp_path)
+    for channel in ("T", "R"):
+        measurements = summary["channels"][channel]
+        for metric in ("si_sdri", "stoi", "stoii", "overlap_si_sdri"):
+            participates = overlap_available if metric == "overlap_si_sdri" else channel in utterance_channels
+            coverage = measurements["metrics"][metric]["recording_coverage"]
+            assert coverage["candidate_recordings"] == 1
+            assert coverage["scored_recordings"] == int(participates)
+            assert coverage["excluded_due_to_errors"] == int(not participates)
+            assert coverage["no_candidate_recordings"] == 0
+            if not participates:
+                reason = "reference_overlap_vad_error" if metric == "overlap_si_sdri" else "reference_vad_error"
+                assert coverage["exclusion_reasons"] == {reason: 1}
+                assert record.channels[channel].metrics[metric].status == "failed"
+        activity = measurements["activity"]["recording_coverage"]
+        assert activity["scored_recordings"] == int(channel in activity_channels)
+        assert activity["excluded_due_to_errors"] == int(channel not in activity_channels)
+    assert core_runtime.vad_calls == [1, 2, 3, 4]

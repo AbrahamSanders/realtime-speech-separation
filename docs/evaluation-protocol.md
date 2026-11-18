@@ -323,3 +323,23 @@ Preserve recording-level results when one channel or metric is unavailable.
 Include counts of inactive reference channels and reference utterances with silent
 separated output so the valid-score means do not conceal missing or spurious speech.
 
+
+
+Report recording participation separately for every channel measurement, in
+addition to interval coverage. Count recordings with at least one scored value,
+recordings with no candidates after successful preprocessing, recordings fully
+excluded due to errors, and recordings with partial interval failures. A full
+error exclusion means required preprocessing failed or every interval candidate
+failed. Undefined and ineligible outcomes are not errors; partial failures retain
+all successful scores. Disabled measurements and missing output channels do not
+enter these recording candidate counts. Invalid audio is counted separately in
+the recording totals because its channel populations are unknown.
+
+Include exclusion counts by reason, counting each distinct reason at most once
+per excluded recording. Multiple reasons can apply to one recording, so their
+sum can exceed the number of excluded recordings. A reference-channel VAD
+failure excludes that channel's reference-utterance measurements and both
+channels' overlap measurements. Activity requires both reference and separated
+VAD for its channel; separated VAD failures do not exclude reference-utterance
+measurements. Keep these failed prerequisites distinct from successful VAD
+finding no qualifying speech.
