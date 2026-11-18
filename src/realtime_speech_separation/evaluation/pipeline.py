@@ -2,15 +2,12 @@
 
 import logging
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 
-import numpy as np
-from numpy.typing import NDArray
-
-from .audio import AudioTriple, load_audio_triple
+from .audio import MIN_RECORDING_SECONDS, AudioTriple, load_audio_triple
 from .metrics import DnsmosP808, MetricScore, Pesq, SiSdr, Stoi, Visqol, centered_zero_energy
 from .reporting import compatible_result, content_digest, evaluation_identity, result_path, write_result
 from .types import (
@@ -53,8 +50,9 @@ METRIC_FAMILIES = {
     "stoii": "stoi",
     "pesq": "pesq",
     "visqol": "visqol",
+    "dnsmos_p808": "dnsmos_p808",
 }
-MetricCall = Callable[[NDArray[np.float32], NDArray[np.float32]], MetricScore]
+IntervalAdapter = SiSdr | Stoi | Pesq | Visqol | DnsmosP808
 
 
 class EvaluationUnavailableError(RuntimeError):
@@ -73,7 +71,7 @@ def _resolve_metrics(names: Sequence[str]) -> tuple[Metric, ...]:
             selected.add(name)
         else:
             raise EvaluationUnavailableError(f"Unknown metric: {name}")
-    unavailable = selected.difference(METRIC_FAMILIES, {"activity", "dnsmos_p808"})
+    unavailable = selected.difference(METRIC_FAMILIES, {"activity"})
     if unavailable:
         raise EvaluationUnavailableError(
             f"Requested metrics are not implemented: {', '.join(sorted(unavailable))}. "
@@ -87,14 +85,16 @@ def _resolve_metrics(names: Sequence[str]) -> tuple[Metric, ...]:
 def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipeline":
     """Preflight selected adapters and the packaged VAD once; never download assets."""
     metrics = _resolve_metrics(metrics)
-    adapters = {}
+    adapters: dict[str, IntervalAdapter] = {}
     # Import and initialize only requested metric families, before any output writes.
     try:
         families = {METRIC_FAMILIES[name] for name in metrics if name in METRIC_FAMILIES}
-        factories = {"si_sdr": SiSdr, "stoi": Stoi, "pesq": Pesq, "visqol": Visqol}
+        factories = {"si_sdr": SiSdr, "stoi": Stoi, "pesq": Pesq, "visqol": Visqol, "dnsmos_p808": DnsmosP808}
         for family in sorted(families):
-            adapters[family] = factories[family]()
-        dnsmos = DnsmosP808() if "dnsmos_p808" in metrics else None
+            adapter = factories[family]()
+            if "min_active_samples" not in getattr(adapter, "parameters", {}):
+                raise RuntimeError(f"{family} adapter must declare min_active_samples")
+            adapters[family] = adapter
         detector = SileroVad()
     except (ImportError, OSError, RuntimeError) as exc:
         raise EvaluationUnavailableError(f"Evaluation backend preflight failed: {exc}") from exc
@@ -105,22 +105,15 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
     model_digests = {"silero_vad.jit": detector.model_digest}
     if "visqol" in adapters:
         model_digests["visqol_speech.tflite"] = adapters["visqol"].model_digest
-    metric_parameters = {name: adapter.parameters for name, adapter in adapters.items()}
-    if dnsmos is not None:
-        versions.update(dnsmos.versions)
-        model_digests.update(dnsmos.model_digests)
-        metric_parameters["dnsmos_p808"] = dnsmos.parameters
-    # Persist the resolved threshold used for each selected interval adapter.
-    metric_parameters = {
-        name: {"min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES, **parameters}
-        for name, parameters in metric_parameters.items()
-    }
+    if "dnsmos_p808" in adapters:
+        model_digests.update(adapters["dnsmos_p808"].model_digests)
     configuration = EvaluationConfig(
         metrics=metrics,
         parameters={
             "protocol_scope": "partial",
             "vad": detector.parameters,
             "timing": {
+                "min_recording_seconds": MIN_RECORDING_SECONDS,
                 "merge_gap_samples": MERGE_GAP_SAMPLES,
                 "utterance_min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES,
                 "overlap_min_active_samples": OVERLAP_MIN_ACTIVE_SAMPLES,
@@ -128,13 +121,13 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
                 "activity_frame_samples": ACTIVITY_FRAME_SAMPLES,
                 "activity_majority": "strict_actual_frame_span",
             },
-            **metric_parameters,
+            **{name: adapter.parameters for name, adapter in adapters.items()},
         },
         metric_backend_versions=versions,
         vad_backend_version=detector.backend_version,
         model_digests=model_digests,
     )
-    return EvaluationPipeline(input_dir, configuration, detector, adapters, dnsmos)
+    return EvaluationPipeline(input_dir, configuration, detector, adapters)
 
 
 def _interval_result(
@@ -175,8 +168,7 @@ class EvaluationPipeline:
         input_dir: Path,
         configuration: EvaluationConfig,
         detector: SpeechDetector,
-        adapters: dict[str, MetricCall],
-        dnsmos: DnsmosP808 | None = None,
+        adapters: dict[str, IntervalAdapter],
     ) -> None:
         """Keep shared resources and resolved identity; do not load audio yet."""
         self.input_dir = input_dir
@@ -184,7 +176,6 @@ class EvaluationPipeline:
         self.evaluation_id = evaluation_identity(configuration)
         self.detector = detector
         self.adapters = adapters
-        self.dnsmos = dnsmos
 
     def _source(self, path: Path) -> AudioSource:
         """Fingerprint bytes independently of decoding, retaining missing paths."""
@@ -313,38 +304,33 @@ class EvaluationPipeline:
                     metrics[name] = MetricResult("failed", reason="reference_vad_error")
                     continue
                 regions, source = prepared.reference_utterances, "reference_utterance"
-            family = METRIC_FAMILIES.get(name, name)
-            min_active_samples = self.configuration.parameters[family]["min_active_samples"]
+            family = METRIC_FAMILIES[name]
+            adapter = self.adapters[family]
+            min_active_samples = adapter.parameters["min_active_samples"]
             candidates = []
             for region in regions:
                 interval = region.interval
-                if name == "overlap_si_sdri" and interval.end - interval.start < OVERLAP_MIN_SPAN_SAMPLES:
-                    candidates.append(
-                        IntervalMetricResult(interval, source, "ineligible", reason="overlap_span_too_short")
-                    )
-                    continue
                 if region.active_samples < min_active_samples:
                     candidates.append(
                         IntervalMetricResult(interval, source, "ineligible", reason="insufficient_activity")
                     )
                     continue
-                if name == "dnsmos_p808":
-                    assert self.dnsmos is not None
-                    output_samples = audio.separated.samples[index, interval.start : interval.end]
-                    score = self.dnsmos(output_samples)
-                    candidates.append(_interval_result(interval, source, score))
-                    continue
                 key = (family, channel, interval)
-                reference_samples = audio.reference.samples[index, interval.start : interval.end]
                 if key not in outputs:
                     output_samples = audio.separated.samples[index, interval.start : interval.end]
-                    outputs[key] = self.adapters[family](reference_samples, output_samples)
+                    if adapter.intrusive:
+                        reference_samples = audio.reference.samples[index, interval.start : interval.end]
+                        outputs[key] = adapter(reference_samples, output_samples)
+                    else:
+                        outputs[key] = adapter(output_samples)
                 baseline = None
                 if name in IMPROVEMENT_METRICS:
                     # Share interval baselines across outputs without pooling T and R.
                     if key not in baselines:
+                        assert adapter.intrusive
+                        reference_samples = audio.reference.samples[index, interval.start : interval.end]
                         mixture_samples = audio.mixture.samples[interval.start : interval.end]
-                        baselines[key] = self.adapters[family](reference_samples, mixture_samples)
+                        baselines[key] = adapter(reference_samples, mixture_samples)
                     baseline = baselines[key]
                 candidate = _interval_result(interval, source, outputs[key], baseline)
                 candidates.append(candidate)

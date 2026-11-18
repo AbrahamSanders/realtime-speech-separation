@@ -12,6 +12,7 @@ from numpy.typing import NDArray
 from .types import RecordingError
 
 EVALUATION_SAMPLE_RATE = 16000
+MIN_RECORDING_SECONDS = 1
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ def _load_audio(path: str, role: Literal["mixture", "reference", "separated"]) -
         return RecordingError(path, f"Expected 1D or 2D audio; got shape {samples.shape}")
     if samples.shape[-1] == 0:
         return RecordingError(path, "Audio waveform is empty")
+    if samples.shape[-1] < MIN_RECORDING_SECONDS * EVALUATION_SAMPLE_RATE:
+        return RecordingError(path, f"Audio must be at least {MIN_RECORDING_SECONDS} second long after resampling")
     if not np.isfinite(samples).all():
         return RecordingError(path, "Audio waveform contains nonfinite samples")
 
@@ -84,9 +87,10 @@ def load_audio_triple(
     """Load three files as float32 at 16 kHz, returning the first input error.
 
     Mono or stereo mixtures are downmixed to (n,). References must have two
-    channels; separations may have one or two. Empty/nonfinite waveforms and
-    unequal resampled lengths are rejected without shifting, truncating, or
-    padding. File errors retain the decoder's reason and the offending path.
+    channels; separations may have one or two. Each waveform must run for at least
+    one second after resampling. Nonfinite waveforms and unequal resampled
+    lengths are rejected without shifting, truncating, or padding. File errors
+    retain the decoder's reason and the offending path.
     Unexpected programming errors propagate to the caller.
     """
     loaded = []

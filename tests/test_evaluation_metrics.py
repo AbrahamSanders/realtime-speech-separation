@@ -158,7 +158,12 @@ def test_pesq_wideband_arguments_and_provenance(fake_pesq: SimpleNamespace) -> N
     sample_rate, ref_arg, est_arg = call.call_args.args
     assert sample_rate == 16000 and ref_arg is reference and est_arg is estimate
     assert call.call_args.kwargs == {"mode": "wb", "on_error": fake_pesq.PesqError.RAISE_EXCEPTION}
-    assert adapter.parameters == {"sample_rate": 16000, "mode": "wb", "on_error": "RAISE_EXCEPTION"}
+    assert adapter.parameters == {
+        "sample_rate": 16000,
+        "mode": "wb",
+        "on_error": "RAISE_EXCEPTION",
+        "min_active_samples": 8000,
+    }
     assert adapter.versions == {"pesq": "test"}
     adapter.parameters.update(sample_rate=8000, mode="nb")
     adapter(reference, estimate)

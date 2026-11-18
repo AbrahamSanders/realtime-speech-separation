@@ -78,7 +78,8 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             return MetricScore("scored", float(reference[0]) + 10 * float(estimate[0]))
 
         score.versions = {family: "test"}
-        score.parameters = {"test": True}
+        score.intrusive = True
+        score.parameters = {"test": True, "min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES}
         if family == "si_sdr":
             score.parameters["min_active_samples"] = OVERLAP_MIN_ACTIVE_SAMPLES
         score.parameters.update(state.metric_parameters.get(family, {}))
@@ -96,7 +97,12 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             return MetricScore("scored", float(estimate[0]))
 
         score.versions = {"onnxruntime": "test"}
-        score.parameters = {"test": True, **state.metric_parameters.get("dnsmos_p808", {})}
+        score.intrusive = False
+        score.parameters = {
+            "test": True,
+            "min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES,
+            **state.metric_parameters.get("dnsmos_p808", {}),
+        }
         score.model_digests = state.dnsmos_model_digests.copy()
         return score
 
@@ -461,6 +467,16 @@ def test_missing_backend_fails_preflight_without_writes(tmp_path, core_runtime, 
     assert not list(tmp_path.glob("summary_*.json"))
 
 
+def test_adapter_requires_minimum_activity_at_preflight(tmp_path, core_runtime, monkeypatch, caplog) -> None:
+    """Reject an incomplete adapter definition before preparing VAD or writing reports."""
+    write_triple(tmp_path)
+    monkeypatch.setattr(pipeline, "Stoi", lambda: SimpleNamespace(parameters={}))
+    assert main(["--input_dir", str(tmp_path), "--metrics", "stoi"]) == 1
+    assert "stoi adapter must declare min_active_samples" in caplog.text
+    assert not core_runtime.loads
+    assert not list(tmp_path.glob("*.json"))
+
+
 def test_empty_selection_and_permutation_rejection(tmp_path, core_runtime) -> None:
     """An empty selected corpus succeeds; permutation remains a configuration error."""
     assert main(["--input_dir", str(tmp_path), "--metrics", "activity"]) == 0
@@ -471,20 +487,16 @@ def test_empty_selection_and_permutation_rejection(tmp_path, core_runtime) -> No
     assert exc.value.code == 2
 
 
-def test_short_recording_preserves_ineligible_overlap_candidate(tmp_path, core_runtime) -> None:
-    """Recordings under 0.5 s retain overlap coverage without calling SI-SDR."""
-    for name, values in (
-        ("short.wav", np.linspace(5, 5.2, 4800)),
-        ("short_reference.wav", np.stack((np.linspace(1, 1.2, 4800), np.linspace(2, 2.2, 4800)), axis=1)),
-        ("short_separated_hash.wav", np.linspace(3, 3.2, 4800)),
-    ):
-        sf.write(tmp_path / name, values, 16000, subtype="FLOAT")
-    assert main(["--input_dir", str(tmp_path), "--metrics", "overlap_si_sdri"]) == 0
+def test_short_recording_is_invalid_before_vad(tmp_path, core_runtime) -> None:
+    """Reject short inputs as recordings before building overlap candidates."""
+    write_triple(tmp_path, name="short", sample_count=15999)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "overlap_si_sdri"]) == 1
     (record,) = results_in(tmp_path)
-    (candidate,) = record.channels["T"].metrics["overlap_si_sdri"].interval_results
-    assert candidate.status == "ineligible"
-    assert candidate.reason == "overlap_span_too_short"
-    assert not core_runtime.scores
+    assert record.status == "invalid"
+    assert record.error.path == "short.wav"
+    assert "at least 1 second" in record.error.reason
+    assert record.configuration.parameters["timing"]["min_recording_seconds"] == 1
+    assert not core_runtime.vad_calls and not core_runtime.scores
 
 
 @pytest.mark.parametrize("active_samples", [3199, 3200])

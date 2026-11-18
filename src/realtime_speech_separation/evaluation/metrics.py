@@ -1,7 +1,8 @@
 """Lazy CPU metric adapters for the evaluation pipeline.
 
-Adapters expose scoring settings in `parameters`. The optional
-`min_active_samples` sets the pipeline's minimum detected speech in a region.
+Adapters declare `parameters["min_active_samples"]` for the pipeline's minimum
+detected speech in a region. The `intrusive` flag indicates whether scoring
+requires a reference waveform.
 """
 
 import warnings
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,7 +19,7 @@ from numpy.typing import NDArray
 from .audio import EVALUATION_SAMPLE_RATE
 from .reporting import content_digest
 from .types import IntervalResultStatus
-from .vad import OVERLAP_MIN_ACTIVE_SAMPLES
+from .vad import OVERLAP_MIN_ACTIVE_SAMPLES, UTTERANCE_MIN_ACTIVE_SAMPLES
 
 MODEL_QUALITY_MIN_ACTIVE_SAMPLES = 3 * EVALUATION_SAMPLE_RATE
 
@@ -58,6 +60,8 @@ class SiSdr:
     scoring errors become failed outcomes; unexpected programming errors escape.
     The optional call is injectable for offline tests.
     """
+
+    intrusive: Literal[True] = True
 
     def __init__(self, call: Callable | None = None) -> None:
         """Resolve the optional functional runtime once, using CPU tensors."""
@@ -107,6 +111,8 @@ class Stoi:
     a genuine zero score is valid. Inputs are equal-length mono float32 arrays.
     """
 
+    intrusive: Literal[True] = True
+
     def __init__(self, call: Callable | None = None) -> None:
         """Resolve the optional function once; allow injected calls in tests."""
         if call is None:
@@ -115,7 +121,11 @@ class Stoi:
             call = stoi
         self._call = call
         self.versions = {name: version(name) for name in ("pystoi", "scipy", "numpy")}
-        self.parameters = {"sample_rate": EVALUATION_SAMPLE_RATE, "extended": False}
+        self.parameters = {
+            "sample_rate": EVALUATION_SAMPLE_RATE,
+            "extended": False,
+            "min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES,
+        }
 
     def __call__(self, reference: NDArray[np.float32], estimate: NDArray[np.float32]) -> MetricScore:
         """Exclude the library's insufficient-speech sentinel using its warning."""
@@ -139,13 +149,20 @@ class Pesq:
     errors and nonfinite scores are failed outcomes.
     """
 
+    intrusive: Literal[True] = True
+
     def __init__(self) -> None:
         """Resolve the PESQ wrapper and its typed errors."""
         import pesq
 
         self._backend = pesq
         self.versions = {"pesq": version("pesq")}
-        self.parameters = {"sample_rate": EVALUATION_SAMPLE_RATE, "mode": "wb", "on_error": "RAISE_EXCEPTION"}
+        self.parameters = {
+            "sample_rate": EVALUATION_SAMPLE_RATE,
+            "mode": "wb",
+            "on_error": "RAISE_EXCEPTION",
+            "min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES,
+        }
 
     def __call__(self, reference: NDArray[np.float32], estimate: NDArray[np.float32]) -> MetricScore:
         """Score a reference utterance using the wrapper's typed error mode."""
@@ -176,6 +193,8 @@ class Visqol:
     inputs use up to nine seconds of the utterance and half a second of silence
     at each edge. Native scoring errors and nonfinite scores are failed outcomes.
     """
+
+    intrusive: Literal[True] = True
 
     def __init__(self) -> None:
         """Load the installed CPU binding and its bundled speech model once."""
@@ -247,6 +266,8 @@ class DnsmosP808:
     extends short inputs and averages their internal window scores. Native
     scoring failures and nonfinite P.808 scores are failed outcomes.
     """
+
+    intrusive: Literal[False] = False
 
     def __init__(self) -> None:
         """Fingerprint both local assets and preload their TorchMetrics CPU sessions."""

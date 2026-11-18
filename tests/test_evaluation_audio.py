@@ -12,8 +12,8 @@ from realtime_speech_separation.evaluation.types import RecordingError
 
 def write_triple(tmp_path: Path, separation_channels: int = 2) -> tuple[Path, Path, Path]:
     """Write an aligned float WAV triple without any enrollment file."""
-    target = np.linspace(-1.5, 1.5, 128, dtype=np.float32)
-    residual = np.linspace(0.5, -0.5, 128, dtype=np.float32)
+    target = np.linspace(-1.5, 1.5, 16000, dtype=np.float32)
+    residual = np.linspace(0.5, -0.5, 16000, dtype=np.float32)
     reference = np.stack((target, residual), axis=1)
     paths = (tmp_path / "call.wav", tmp_path / "call_reference.wav", tmp_path / "call_separated_hash.wav")
     for path, samples in zip(paths, (target + residual, reference, reference[:, :separation_channels]), strict=True):
@@ -25,7 +25,7 @@ def write_triple(tmp_path: Path, separation_channels: int = 2) -> tuple[Path, Pa
 def test_load_shapes_and_preserve_samples(tmp_path: Path, separation_shape: str) -> None:
     """Channel order, offset, amplitude, and length survive 16 kHz loading."""
     paths = write_triple(tmp_path)
-    separated = np.arange(256, dtype=np.float32).reshape(128, 2) / 32 + 2
+    separated = np.arange(32000, dtype=np.float32).reshape(16000, 2) / 32 + 2
     if separation_shape == "mono":
         separated = separated[:, 0]
     elif separation_shape == "single_channel":
@@ -35,10 +35,10 @@ def test_load_shapes_and_preserve_samples(tmp_path: Path, separation_shape: str)
     audio = load_audio_triple(*paths)
 
     assert isinstance(audio, AudioTriple)
-    assert audio.mixture.samples.shape == (128,)
-    assert audio.reference.samples.shape == (2, 128)
-    assert audio.separated.samples.shape == (2 if separation_shape == "stereo" else 1, 128)
-    assert audio.sample_count == 128
+    assert audio.mixture.samples.shape == (16000,)
+    assert audio.reference.samples.shape == (2, 16000)
+    assert audio.separated.samples.shape == (2 if separation_shape == "stereo" else 1, 16000)
+    assert audio.sample_count == 16000
     for path, loaded in zip(paths, (audio.mixture, audio.reference, audio.separated), strict=True):
         expected, _ = sf.read(path, dtype="float32", always_2d=True)
         np.testing.assert_array_equal(loaded.samples.reshape(expected.T.shape), expected.T)
@@ -51,21 +51,22 @@ def test_load_shapes_and_preserve_samples(tmp_path: Path, separation_shape: str)
 def test_stereo_mixture_is_downmixed(tmp_path: Path) -> None:
     """Preserve the CLI's mono-loading behavior for a stereo mixture."""
     paths = write_triple(tmp_path)
-    mixture = np.tile(np.array([2, 4], dtype=np.float32), (128, 1))
+    mixture = np.tile(np.array([2, 4], dtype=np.float32), (16000, 1))
     sf.write(paths[0], mixture, 16000, subtype="FLOAT")
 
     audio = load_audio_triple(*paths)
 
     assert isinstance(audio, AudioTriple)
     assert audio.mixture.native_channels == 2
-    np.testing.assert_array_equal(audio.mixture.samples, np.full(128, 3, dtype=np.float32))
+    np.testing.assert_array_equal(audio.mixture.samples, np.full(16000, 3, dtype=np.float32))
 
 
-def test_resample_different_native_rates(tmp_path: Path) -> None:
-    """Equal durations yield equal lengths after independent resampling."""
+@pytest.mark.parametrize("reference_frames", [47999, 48000])
+def test_resample_different_native_rates(tmp_path: Path, reference_frames: int) -> None:
+    """Accept a triple with one second of audio per file after resampling."""
     paths = write_triple(tmp_path)
     rates = (8000, 48000, 16000)
-    lengths = (801, 4806, 1602)
+    lengths = (8000, reference_frames, 16000)
     for path, rate, length, channels in zip(paths, rates, lengths, (1, 2, 1), strict=True):
         samples = np.full((length, channels), 0.25, dtype=np.float32)
         sf.write(path, samples, rate, subtype="FLOAT")
@@ -73,10 +74,10 @@ def test_resample_different_native_rates(tmp_path: Path) -> None:
     audio = load_audio_triple(*paths)
 
     assert isinstance(audio, AudioTriple)
-    assert audio.sample_count == 1602
+    assert audio.sample_count == 16000
     for loaded, rate in zip((audio.mixture, audio.reference, audio.separated), rates, strict=True):
         assert loaded.native_sample_rate == rate
-        assert loaded.samples.shape[-1] == 1602
+        assert loaded.samples.shape[-1] == 16000
         assert loaded.samples.dtype == np.float32
         np.testing.assert_allclose(loaded.samples[..., 100:-100], 0.25, atol=2e-4)
 
@@ -84,7 +85,7 @@ def test_resample_different_native_rates(tmp_path: Path) -> None:
 def test_pcm_subtype_is_accepted(tmp_path: Path) -> None:
     """Evaluation does not enforce floating-point WAV storage."""
     paths = write_triple(tmp_path)
-    sf.write(paths[0], np.zeros(128, dtype=np.int16), 16000, subtype="PCM_16")
+    sf.write(paths[0], np.zeros(16000, dtype=np.int16), 16000, subtype="PCM_16")
     audio = load_audio_triple(*paths)
     assert isinstance(audio, AudioTriple)
     assert audio.mixture.samples.dtype == np.float32
@@ -120,12 +121,28 @@ def test_empty_waveform(tmp_path: Path, file_index: int) -> None:
 
 
 @pytest.mark.parametrize("file_index", [0, 1, 2])
+@pytest.mark.parametrize(("sample_rate", "frames"), [(16000, 15999), (48000, 47997)])
+def test_audio_just_under_one_second_is_rejected(
+    tmp_path: Path, file_index: int, sample_rate: int, frames: int
+) -> None:
+    """Reject any file with fewer than 16000 samples after resampling."""
+    paths = write_triple(tmp_path)
+    channels = 2 if file_index == 1 else 1
+    samples = np.zeros((frames, channels), dtype=np.float32)
+    sf.write(paths[file_index], samples, sample_rate, subtype="FLOAT")
+
+    error = load_audio_triple(*paths)
+
+    assert error == RecordingError(str(paths[file_index]), "Audio must be at least 1 second long after resampling")
+
+
+@pytest.mark.parametrize("file_index", [0, 1, 2])
 @pytest.mark.parametrize("nonfinite", [np.nan, np.inf, -np.inf])
 @pytest.mark.parametrize("sample_rate", [8000, 16000])
 def test_nonfinite_waveform(tmp_path: Path, file_index: int, nonfinite: float, sample_rate: int) -> None:
     """Nonfinite input is rejected during loading or waveform validation."""
     paths = write_triple(tmp_path)
-    samples = np.zeros((128, 2 if file_index == 1 else 1), dtype=np.float32)
+    samples = np.zeros((sample_rate, 2 if file_index == 1 else 1), dtype=np.float32)
     samples[50, -1] = nonfinite
     sf.write(paths[file_index], samples, sample_rate, subtype="FLOAT")
     error = load_audio_triple(*paths)
@@ -138,7 +155,7 @@ def test_nonfinite_waveform(tmp_path: Path, file_index: int, nonfinite: float, s
 def test_wrong_channel_count(tmp_path: Path, file_index: int, channels: int) -> None:
     """Reject mono references and unsupported multichannel recordings."""
     paths = write_triple(tmp_path)
-    sf.write(paths[file_index], np.zeros((128, channels), dtype=np.float32), 16000, subtype="FLOAT")
+    sf.write(paths[file_index], np.zeros((16000, channels), dtype=np.float32), 16000, subtype="FLOAT")
     error = load_audio_triple(*paths)
     assert isinstance(error, RecordingError)
     assert error.path == str(paths[file_index])
@@ -146,7 +163,7 @@ def test_wrong_channel_count(tmp_path: Path, file_index: int, channels: int) -> 
 
 
 @pytest.mark.parametrize("file_index", [1, 2])
-@pytest.mark.parametrize(("sample_rate", "length"), [(16000, 127), (16000, 129), (8000, 65)])
+@pytest.mark.parametrize(("sample_rate", "length"), [(16000, 16001), (16000, 16017), (8000, 8001)])
 def test_unequal_resampled_lengths(tmp_path: Path, file_index: int, sample_rate: int, length: int) -> None:
     """Length mismatches are errors even when native sample rates differ."""
     paths = write_triple(tmp_path)
@@ -156,12 +173,12 @@ def test_unequal_resampled_lengths(tmp_path: Path, file_index: int, sample_rate:
     assert isinstance(error, RecordingError)
     assert error.path == str(paths[file_index])
     assert "Resampled length" in error.reason
-    assert "mixture length 128" in error.reason
+    assert "mixture length 16000" in error.reason
 
 
 def test_silent_channels_are_valid(tmp_path: Path) -> None:
     """Silence is a metric eligibility concern rather than invalid audio."""
     paths = write_triple(tmp_path)
     for path, channels in zip(paths, (1, 2, 1), strict=True):
-        sf.write(path, np.zeros((128, channels), dtype=np.float32), 16000, subtype="FLOAT")
+        sf.write(path, np.zeros((16000, channels), dtype=np.float32), 16000, subtype="FLOAT")
     assert isinstance(load_audio_triple(*paths), AudioTriple)

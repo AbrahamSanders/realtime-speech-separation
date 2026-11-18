@@ -76,8 +76,7 @@ Settled in Stage 1 and recorded in the [protocol](../evaluation-protocol.md).
 The following is the implementation checklist; the protocol owns the definitions.
 
 - **Overlap padding:** at recording boundaries, move unavailable padding to the
-  other side. If the recording cannot provide a 0.5-second span, mark the region
-  ineligible.
+  other side. Evaluation requires at least one second of audio per file.
 - **Activity frames:** a strict majority means more than 50%; ties are inactive.
   Use the actual duration of the final partial frame.
 - **SI-SDR:** use `zero_mean=True`; record dtype and metric-backend epsilon behavior.
@@ -803,27 +802,31 @@ JSON and CSV reporting, and reuse of both results.
 
 #### Follow-up on metric activity and settings
 
-The pipeline reads each interval adapter's optional `min_active_samples`
-setting and resolves missing values to the VAD utterance default. ViSQOL
-requires three seconds of reference activity, and DNSMOS requires three
-seconds of separated activity. The check uses original VAD activity, excluding
-merged gaps and padding. Under-threshold candidates retain their bounds and are
+Each interval adapter declares `min_active_samples` in its settings. Preflight
+rejects adapter definitions that omit it. PESQ and STOI declare the standard
+VAD utterance minimum. ViSQOL requires three seconds of reference activity,
+and DNSMOS requires three seconds of separated activity. The check uses original
+VAD activity, excluding merged gaps and padding. Under-threshold candidates retain their bounds and are
 reported as `ineligible/insufficient_activity`. The shared SI-SDRi adapter
 uses the 0.2-second overlap minimum. Ordinary SI-SDRi candidates still come
 from utterance extraction, which requires 0.5 seconds of activity. Eligible
-overlaps are padded to a half-second span when needed. An overlap candidate
-retains the span-specific reason when the recording cannot provide that span.
+overlaps are padded to a half-second span when needed. The loader rejects
+files shorter than one second after resampling, so accepted recordings
+always have room for the required overlap padding.
 
-The evaluation ID includes the resolved minimum for each selected interval
-adapter. The adapters use their recorded parameters to configure and invoke
-their backends. ViSQOL and DNSMOS also reject direct calls with waveform spans
-too short to contain the required activity. See the [evaluation protocol](../evaluation-protocol.md).
+The evaluation ID includes the recording length minimum and each selected
+interval adapter's activity minimum. The adapters use their recorded parameters
+to configure and invoke their backends. The pipeline invokes all interval
+adapters through a shared path and passes a reference waveform only when the
+adapter declares `intrusive`. ViSQOL and DNSMOS also reject direct calls with
+waveform spans too short to contain the required activity.
+See the [evaluation protocol](../evaluation-protocol.md).
 
-Ruff lint and formatting, `git diff --check`, and the full pytest suite passed
-(224 passed, four opt-in tests skipped). All four opt-in CPU tests passed
-separately using the existing ViSQOL build and compatible Protobuf runtime.
-A CLI smoke test verified that both metrics reported a shorter utterance as
-ineligible and scored a longer utterance from temporary test-speech triples.
+Ruff lint and formatting, `git diff --check`, and pytest passed
+(234 passed, four opt-in tests skipped). A CPU CLI smoke test selected both
+ViSQOL and DNSMOS on temporary copies of test speech. Both metrics reported a
+shorter utterance as ineligible and scored a longer utterance. The rerun reused
+both results.
 
 ### Stage 8 — Add WeSpeaker similarity
 

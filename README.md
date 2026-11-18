@@ -84,8 +84,9 @@ STOI, and STOI improvement. Select individual metrics with, for example,
 
 Evaluation uses the supplied mixture, reference, and separated audio and packaged
 Silero VAD on CPU. Enrollment and dataset metadata are unnecessary. Channels keep
-their target/residual assignment; target-only output is supported. Audio is
-resampled to 16 kHz and must then have equal lengths and already be aligned.
+their target/residual assignment; target-only output is supported. Evaluation
+resamples the audio to 16 kHz. The three files must already be aligned and
+must have equal lengths of at least one second after resampling.
 
 Per-separation results are written beside the mixture as
 `<file_id>_results_<inference_hash>_<evaluation_id>.json`. Reports in `input_dir`

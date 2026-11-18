@@ -16,7 +16,8 @@ Every sample to evaluate will consist of three audio recordings:
 where:
 - **n:** number of samples in the input mixture, reference, and separated recordings (must be the same across all three).
 
-For evaluation, all three audio recordings must be at the same sampling rate and temporally aligned.
+All three recordings must be temporally aligned and have equal sample counts
+of at least 16,000 samples (one second) after resampling to 16 kHz.
 
 Evaluation includes the following metrics:
 1. **Separation Quality** - SI-SDRi, Speech Activity P/R/F1
@@ -74,10 +75,9 @@ Overlap regions are identified by the temporal intersections of VAD-active regio
 4. Overlap regions shorter than 0.2 seconds or containing less than 0.2 seconds of active speech are discarded,
    and remaining overlap regions shorter than 0.5 seconds are padded evenly on both sides to reach 0.5 seconds.
 
-At a recording boundary, move unavailable padding to the other side. If the
-whole recording cannot supply a 0.5-second span, the region is ineligible.
-For an odd padding sample count, put the extra sample on the right before
-adjusting for boundaries. Padding does not increase the original active duration.
+At a recording boundary, move unavailable padding to the other side. For an odd
+padding sample count, put the extra sample on the right before adjusting for
+boundaries. Padding does not increase the original active duration.
 
 #### Transcription
 

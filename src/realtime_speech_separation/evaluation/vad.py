@@ -131,9 +131,8 @@ def overlap_regions(
     """Intersect raw speech, merge, filter at 0.2 s activity, then pad to 0.5 s.
 
     Padding uses the right side for an odd extra sample and transfers unavailable
-    boundary padding to the other side. If the recording is shorter than 0.5 s,
-    retain the unpadded candidate: the scoring adapter must mark its short span
-    ineligible so reporting preserves its candidate count.
+    boundary padding to the other side. On inputs shorter than 0.5 s, retain the
+    original bounds. The evaluation loader requires a longer recording.
     """
     intersections = intersect_intervals(target, residual)
     merged_regions = merge_regions(intersections)
