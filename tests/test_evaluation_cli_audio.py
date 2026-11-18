@@ -1,81 +1,393 @@
-"""Exercise the CLI's audio boundary without optional scoring dependencies."""
+"""Synthetic end-to-end core CLI fixture with offline VAD and metric resources."""
 
+import csv
 import json
-import sys
+from collections import Counter
 from pathlib import Path
-from types import ModuleType
-from unittest.mock import Mock
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import soundfile as sf
 
 from realtime_speech_separation.eval_cli import main
+from realtime_speech_separation.evaluation import pipeline
+from realtime_speech_separation.evaluation.metrics import MetricScore
+from realtime_speech_separation.evaluation.reporting import parse_result, result_path
+from realtime_speech_separation.evaluation.types import Interval
+from realtime_speech_separation.evaluation.vad import VadBackendError
 
 
 @pytest.fixture
-def legacy_metrics(monkeypatch: pytest.MonkeyPatch) -> Mock:
-    """Stub legacy scoring/reporting until the protocol pipeline replaces them."""
-    metrics = ModuleType("asteroid.metrics")
-    scorer = Mock()
-    metrics.get_metrics = scorer
-    monkeypatch.setitem(sys.modules, "asteroid", ModuleType("asteroid"))
-    monkeypatch.setitem(sys.modules, "asteroid.metrics", metrics)
-    pandas = ModuleType("pandas")
-    pandas.DataFrame = Mock()
-    monkeypatch.setitem(sys.modules, "pandas", pandas)
-    return scorer
+def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Inject resources at their preflight boundary, exercising the rest of the CLI."""
+    state = SimpleNamespace(loads=Counter(), vad_calls=[], scores=[], metric_failure=False, vad_failure=None)
+
+    class Detector:
+        """Return distinct reference T/R timing and matching output timing."""
+
+        backend_version = "test-vad"
+        torch_version = "test-torch"
+        model_digest = "test-model"
+        parameters = {"threshold": 0.5}
+
+        def __init__(self):
+            """Track once-per-invocation model initialization."""
+            state.loads["vad"] += 1
+
+        def __call__(self, samples):
+            """Map synthetic channel identifiers to independent speech intervals."""
+            identifier = round(float(samples[0]))
+            state.vad_calls.append(identifier)
+            failures = state.vad_failure if isinstance(state.vad_failure, tuple) else (state.vad_failure,)
+            if identifier in failures:
+                raise VadBackendError("test VAD failure")
+            if identifier == 0:
+                return ()
+            start, end = (0, 10000) if identifier in (1, 3) else (6000, 16000)
+            return (Interval(min(start, max(0, len(samples) - 3200)), min(end, len(samples))),)
+
+    def adapter_factory(family):
+        """Create deterministic functions with version/settings provenance."""
+        state.loads[family] += 1
+
+        def score(reference, estimate):
+            """Retain actual slices so tests can inspect channel/interval identity."""
+            state.scores.append((family, reference.copy(), estimate.copy()))
+            if state.metric_failure and family == "si_sdr" and round(float(estimate[0])) == 3:
+                return MetricScore("failed", reason="test_metric_failure")
+            return MetricScore("scored", float(reference[0]) + 10 * float(estimate[0]))
+
+        score.versions = {family: "test"}
+        score.parameters = {"test": True}
+        return score
+
+    monkeypatch.setattr(pipeline, "SileroVad", Detector)
+    monkeypatch.setattr(pipeline, "SiSdr", lambda: adapter_factory("si_sdr"))
+    monkeypatch.setattr(pipeline, "Stoi", lambda: adapter_factory("stoi"))
+    return state
+
+
+def write_triple(root: Path, name: str = "call_name", channels: int = 2, variants=("config_with_suffix",)) -> Path:
+    """Write float WAVs with identifiable T/R, mixture, and separated samples."""
+    mixture_file = root / f"{name}.wav"
+    mixture_file.parent.mkdir(parents=True, exist_ok=True)
+    ramp = np.linspace(0, 0.2, 16000, dtype=np.float32)
+    reference = np.stack((1 + ramp, 2 + ramp), axis=1)
+    separated = np.stack((3 + ramp, 4 + ramp), axis=1)[:, :channels]
+    sf.write(mixture_file, 5 + ramp, 16000, subtype="FLOAT")
+    sf.write(root / f"{name}_reference.wav", reference, 16000, subtype="FLOAT")
+    for variant in variants:
+        sf.write(root / f"{name}_separated_{variant}.wav", separated, 16000, subtype="FLOAT")
+    return mixture_file
+
+
+def results_in(root: Path) -> list:
+    """Parse only adjacent result records, validating their persisted schema."""
+    return [parse_result(path.read_text()) for path in sorted(root.rglob("*_results_*.json"))]
 
 
 @pytest.mark.parametrize("channels", [1, 2])
-def test_cli_loads_triple_without_enrollment(tmp_path: Path, legacy_metrics: Mock, channels: int) -> None:
-    """The CLI passes validated T or T/R audio to its current metric backend."""
-    mixture = np.linspace(-0.5, 0.5, 128, dtype=np.float32)
-    reference = np.stack((mixture, -mixture), axis=1)
-    separated = reference[:, :channels]
-    for name, samples in (
-        ("call_name.wav", mixture),
-        ("call_name_reference.wav", reference),
-        ("call_name_separated_config_with_suffix.wav", separated),
-    ):
-        sf.write(tmp_path / name, samples, 16000, subtype="FLOAT")
-    legacy_metrics.return_value = {"si_sdr": np.zeros(channels)}
-
-    assert main(["--input_dir", str(tmp_path), "--input_filter", "CALL_NAME.wav", "--overwrite"]) == 0
-
-    legacy_metrics.assert_called_once()
-    arguments = legacy_metrics.call_args.kwargs
-    np.testing.assert_array_equal(arguments["mix"], mixture)
-    np.testing.assert_array_equal(arguments["clean"], reference[:, :channels].T)
-    np.testing.assert_array_equal(arguments["estimate"], separated.T)
-    assert arguments["sample_rate"] == 16000
+def test_cli_loads_and_scores_triple_without_enrollment(tmp_path, core_runtime, channels, caplog) -> None:
+    """The whole pipeline preserves T/R assignment and valid target-only results."""
+    write_triple(tmp_path, channels=channels)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core", "--overwrite"]) == 0
+    (record,) = results_in(tmp_path)
+    assert record.inference_hash == "config_with_suffix"
+    assert record.output_channels == (("T",) if channels == 1 else ("T", "R"))
+    assert record.sources.mixture.native_sample_rate == 16000
+    assert record.sources.separated.native_channels == channels
+    assert record.sources.reference.sha256
+    assert record.configuration.parameters["protocol_scope"] == "partial"
+    assert "partial protocol evaluation" in caplog.text
     assert not (tmp_path / "call_name_enrollment.wav").exists()
-    assert (tmp_path / "call_name_results_config_with_suffix.json").is_file()
-    summary = json.loads((tmp_path / "summary_config_with_suffix.json").read_text())
-    assert summary["total_count"] == 1
-    assert len(summary["si_sdr"]["mean"]) == channels
+    target = record.channels["T"]
+    assert target.metrics["si_sdri"].interval_results[0].interval == Interval(0, 10000)
+    assert target.metrics["overlap_si_sdri"].interval_results[0].interval == Interval(4000, 12000)
+    assert target.activity.counts.tp == 6
+    for _family, reference, estimate in core_runtime.scores:
+        assert reference.dtype == estimate.dtype == np.float32
+        assert reference.shape == estimate.shape
+        expected = (3, 5) if round(float(reference[0])) == 1 else (4, 5)
+        assert round(float(estimate[0])) in expected
+    for channel in record.output_channels:
+        for metric in ("si_sdri", "overlap_si_sdri", "stoii"):
+            for score in record.channels[channel].metrics[metric].interval_results:
+                assert score.value == pytest.approx(score.output_score - score.input_score)
+    (summary_file,) = tmp_path.glob("summary_*.json")
+    summary = json.loads(summary_file.read_text())
+    assert summary["recordings"]["total"] == 1
+    assert summary["channels"]["T"]["metrics"]["stoi"]["coverage"]["scored"] == 1
+    (csv_file,) = tmp_path.glob("metrics_*.csv")
+    with csv_file.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["T_stoi_status"] == "enabled"
+    assert rows[0]["T_activity_tp"] == "6"
 
 
-def test_cli_continues_after_invalid_audio(
-    tmp_path: Path, legacy_metrics: Mock, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A bad triple does not block a valid one, but makes the run unsuccessful."""
-    mixture = np.zeros(128, dtype=np.float32)
-    reference = np.zeros((128, 2), dtype=np.float32)
-    for name, samples in (
-        ("a_invalid.wav", mixture),
-        ("a_invalid_separated_hash.wav", reference),
-        ("b_valid.wav", mixture),
-        ("b_valid_reference.wav", reference),
-        ("b_valid_separated_hash.wav", reference),
-    ):
-        sf.write(tmp_path / name, samples, 16000, subtype="FLOAT")
-    legacy_metrics.return_value = {"si_sdr": np.zeros(2)}
+def test_cli_reuses_reference_baselines_and_cached_results(tmp_path, core_runtime) -> None:
+    """Reference VAD/baselines stay local to a mixture and cached reruns do no scoring."""
+    write_triple(tmp_path, variants=("one", "two"))
+    args = ["--input_dir", str(tmp_path), "--metrics", "core"]
+    assert main(args) == 0
+    assert core_runtime.loads == {"vad": 1, "si_sdr": 1, "stoi": 1}
+    assert core_runtime.vad_calls == [1, 2, 3, 4, 3, 4]
+    # Two channels, SI-SDR utterance + overlap and STOI utterance: six baselines.
+    baselines = [call for call in core_runtime.scores if round(float(call[2][0])) == 5]
+    assert len(baselines) == 6
+    assert sorted({len(call[1]) for call in baselines}) == [8000, 10000]
+    count = len(core_runtime.scores)
+    saved = {path: path.read_bytes() for path in tmp_path.glob("*_results_*.json")}
+    assert main(args) == 0
+    assert len(core_runtime.scores) == count
+    assert core_runtime.vad_calls == [1, 2, 3, 4, 3, 4]
+    assert all(path.read_bytes() == payload for path, payload in saved.items())
+    assert all(json.loads(path.read_text())["recordings"]["reused"] == 1 for path in tmp_path.glob("summary_*.json"))
+    assert main([*args, "--overwrite"]) == 0
+    assert len(core_runtime.scores) == 2 * count
 
-    assert main(["--input_dir", str(tmp_path), "--overwrite"]) == 1
 
-    legacy_metrics.assert_called_once()
+def test_changed_audio_configuration_and_malformed_results_recompute(tmp_path, core_runtime) -> None:
+    """Source bytes and resolved settings both control persisted result reuse."""
+    mixture = write_triple(tmp_path)
+    args = ["--input_dir", str(tmp_path), "--metrics", "stoi"]
+    assert main(args) == 0
+    (first,) = results_in(tmp_path)
+    count = len(core_runtime.scores)
+    sf.write(mixture, np.linspace(5, 6, 16000, dtype=np.float32), 16000, subtype="FLOAT")
+    assert main(args) == 0
+    assert len(core_runtime.scores) > count
+    (second,) = results_in(tmp_path)
+    assert second.evaluation_id == first.evaluation_id
+    assert second.sources.mixture.sha256 != first.sources.mixture.sha256
+    path = result_path(mixture, second.inference_hash, second.evaluation_id)
+    path.write_text('{"legacy": true}')
+    count = len(core_runtime.scores)
+    assert main(args) == 0
+    assert len(core_runtime.scores) > count
+    assert main(["--input_dir", str(tmp_path), "--metrics", "activity"]) == 0
+    assert len(results_in(tmp_path)) == 2
+
+
+def test_filtered_cached_reports_coexist_with_full_set(tmp_path, core_runtime) -> None:
+    """Only reached cached results contribute, preserving the earlier full-set report."""
+    write_triple(tmp_path / "DatasetA")
+    write_triple(tmp_path / "DatasetB", channels=1)
+    args = ["--input_dir", str(tmp_path), "--metrics", "stoi"]
+    assert main(args) == 0
+    (full,) = tmp_path.glob("summary_*_all.json")
+    saved = full.read_bytes()
+    count = len(core_runtime.scores)
+    assert main([*args, "--input_filter", "DATASETA"]) == 0
+    assert len(core_runtime.scores) == count
+    assert full.read_bytes() == saved
+    (selected,) = [path for path in tmp_path.glob("summary_*.json") if path != full]
+    summary = json.loads(selected.read_text())
+    assert summary["recordings"]["total"] == summary["recordings"]["reused"] == 1
+    assert summary["selection"]["filter_terms"] == ["dataseta"]
+    assert summary["selection"]["mixture_paths"] == ["DatasetA/call_name.wav"]
+
+
+@pytest.mark.parametrize("failure", ["metric", "reference_vad", "output_vad"])
+def test_backend_failure_isolation_and_failed_result_retry(tmp_path, core_runtime, failure) -> None:
+    """Failures return nonzero, preserve independent outcomes, and cannot be reused."""
+    write_triple(tmp_path)
+    if failure == "metric":
+        core_runtime.metric_failure = True
+    else:
+        core_runtime.vad_failure = 1 if failure == "reference_vad" else 3
+    args = ["--input_dir", str(tmp_path), "--metrics", "core"]
+    assert main(args) == 1
+    (record,) = results_in(tmp_path)
+    if failure == "metric":
+        assert record.channels["T"].metrics["si_sdri"].interval_results[0].status == "failed"
+        assert record.channels["T"].metrics["stoi"].interval_results[0].status == "scored"
+        assert record.channels["R"].metrics["si_sdri"].interval_results[0].status == "scored"
+    elif failure == "output_vad":
+        assert record.channels["T"].activity.status == "failed"
+        assert record.channels["R"].activity.status == "scored"
+        assert record.channels["T"].metrics["stoi"].interval_results[0].status == "scored"
+    else:
+        assert record.status == "failed"
+        assert record.channels["T"].activity.status == "failed"
+    core_runtime.metric_failure = False
+    core_runtime.vad_failure = None
+    assert main(args) == 0
+    (summary_file,) = tmp_path.glob("summary_*.json")
+    assert json.loads(summary_file.read_text())["recordings"]["reused"] == 0
+
+
+def test_cli_continues_after_invalid_audio(tmp_path, core_runtime, caplog) -> None:
+    """A missing reference becomes an invalid result without losing later inputs."""
+    write_triple(tmp_path, "a_invalid")
+    (tmp_path / "a_invalid_reference.wav").unlink()
+    write_triple(tmp_path, "b_valid")
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core"]) == 1
+    records = results_in(tmp_path)
+    assert [record.status for record in records] == ["invalid", "processed"]
+    assert records[0].error.path == "a_invalid_reference.wav"
     assert "a_invalid_reference.wav" in caplog.text
-    assert not (tmp_path / "a_invalid_results_hash.json").exists()
-    summary = json.loads((tmp_path / "summary_hash.json").read_text())
-    assert summary["total_count"] == 1
+    (summary_file,) = tmp_path.glob("summary_*.json")
+    summary = json.loads(summary_file.read_text())
+    assert summary["recordings"]["invalid"] == summary["recordings"]["processed"] == 1
+
+
+@pytest.mark.parametrize("selection", [[], ["--metrics", "all"], ["--metrics", "pesq"], ["--metrics", "core", "wer"]])
+def test_unimplemented_selections_fail_before_preflight(tmp_path, core_runtime, selection, caplog) -> None:
+    """All remains the full protocol and cannot silently fall back to core."""
+    assert main(["--input_dir", str(tmp_path), *selection]) == 1
+    assert not core_runtime.loads
+    assert "not implemented" in caplog.text
+    assert not list(tmp_path.iterdir())
+
+
+def test_missing_backend_fails_preflight_without_writes(tmp_path, core_runtime, monkeypatch, caplog) -> None:
+    """A missing requested runtime prevents partial processing of a run."""
+    write_triple(tmp_path)
+
+    def unavailable():
+        """Mimic an unavailable optional dependency."""
+        raise ImportError("test missing pystoi")
+
+    monkeypatch.setattr(pipeline, "Stoi", unavailable)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core"]) == 1
+    assert "preflight failed" in caplog.text
+    assert not list(tmp_path.glob("*_results_*.json"))
+    assert not list(tmp_path.glob("summary_*.json"))
+
+
+def test_empty_selection_and_permutation_rejection(tmp_path, core_runtime) -> None:
+    """An empty selected corpus succeeds; permutation remains a configuration error."""
+    assert main(["--input_dir", str(tmp_path), "--metrics", "activity"]) == 0
+    assert core_runtime.loads == {"vad": 1}
+    assert not list(tmp_path.iterdir())
+    with pytest.raises(SystemExit) as exc:
+        main(["--input_dir", str(tmp_path), "--compute_permutation"])
+    assert exc.value.code == 2
+
+
+def test_short_recording_preserves_ineligible_overlap_candidate(tmp_path, core_runtime) -> None:
+    """Recordings under 0.5 s retain overlap coverage without calling SI-SDR."""
+    for name, values in (
+        ("short.wav", np.linspace(5, 5.2, 4800)),
+        ("short_reference.wav", np.stack((np.linspace(1, 1.2, 4800), np.linspace(2, 2.2, 4800)), axis=1)),
+        ("short_separated_hash.wav", np.linspace(3, 3.2, 4800)),
+    ):
+        sf.write(tmp_path / name, values, 16000, subtype="FLOAT")
+    assert main(["--input_dir", str(tmp_path), "--metrics", "overlap_si_sdri"]) == 0
+    (record,) = results_in(tmp_path)
+    (candidate,) = record.channels["T"].metrics["overlap_si_sdri"].interval_results
+    assert candidate.status == "ineligible"
+    assert candidate.reason == "overlap_span_too_short"
+    assert not core_runtime.scores
+
+
+def test_silent_outputs_keep_missing_utterance_diagnostics(tmp_path, core_runtime) -> None:
+    """Missing speech is measured on reference intervals independently of output VAD."""
+    write_triple(tmp_path)
+    sf.write(tmp_path / "call_name_separated_config_with_suffix.wav", np.zeros(16000), 16000, subtype="FLOAT")
+    assert main(["--input_dir", str(tmp_path), "--metrics", "activity"]) == 0
+    (record,) = results_in(tmp_path)
+    target = record.channels["T"]
+    assert target.separated_vad == ()
+    assert target.separated_missing_utterances == (Interval(0, 10000),)
+    assert target.activity.counts.fn == 6
+    assert target.metrics["si_sdri"].status == "disabled"
+
+
+def test_no_speech_and_all_invalid_reports(tmp_path, core_runtime) -> None:
+    """Known inference IDs retain zero-count reports for empty candidate populations."""
+    write_triple(tmp_path)
+    for path in tmp_path.glob("*.wav"):
+        samples = np.zeros((16000, 2)) if "reference" in path.name else np.zeros(16000)
+        sf.write(path, samples, 16000, subtype="FLOAT")
+    args = ["--input_dir", str(tmp_path), "--metrics", "core"]
+    assert main(args) == 0
+    (summary_file,) = tmp_path.glob("summary_*.json")
+    summary = json.loads(summary_file.read_text())
+    assert summary["channels"]["T"]["metrics"]["si_sdri"]["distribution"]["mean"] is None
+    assert summary["channels"]["T"]["activity"]["precision"] is None
+    assert not core_runtime.scores
+    (tmp_path / "call_name_reference.wav").unlink()
+    assert main(args) == 1
+    summary = json.loads(summary_file.read_text())
+    assert summary["recordings"]["invalid"] == 1
+    assert summary["recordings"]["processed"] == 0
+
+
+def test_ambiguous_outputs_and_missing_directory_fail(tmp_path, core_runtime, caplog) -> None:
+    """Do not overwrite a result when two audio formats have the same inference suffix."""
+    write_triple(tmp_path)
+    values = np.zeros(16000, dtype=np.float32)
+    sf.write(tmp_path / "call_name_separated_config_with_suffix.flac", values, 16000)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core"]) == 1
+    assert "share an inference suffix" in caplog.text
+    assert not list(tmp_path.glob("*_results_*.json"))
+    assert main(["--input_dir", str(tmp_path / "missing"), "--metrics", "activity"]) == 1
+    (tmp_path / "call_name_separated_config_with_suffix.flac").unlink()
+    sf.write(tmp_path / "call_name.flac", values, 16000)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "activity"]) == 1
+    assert "share a stem" in caplog.text
+
+
+def test_vad_failure_reason_survives_disabled_activity(tmp_path, core_runtime) -> None:
+    """A failed VAD remains diagnosable in interval-only selections and cannot be reused."""
+    write_triple(tmp_path)
+    core_runtime.vad_failure = 3
+    args = ["--input_dir", str(tmp_path), "--metrics", "stoi"]
+    assert main(args) == 1
+    (record,) = results_in(tmp_path)
+    assert record.channels["T"].activity.status == "disabled"
+    assert record.channels["T"].separated_vad_error == "test VAD failure"
+    assert record.channels["T"].metrics["stoi"].interval_results[0].status == "scored"
+    core_runtime.vad_failure = None
+    assert main(args) == 0
+
+
+@pytest.mark.parametrize("failed_identifier", [1, 2])
+def test_reference_vad_failure_preserves_independent_populations(tmp_path, core_runtime, failed_identifier) -> None:
+    """Failed reference VAD never blocks output VAD or the other reference channel."""
+    write_triple(tmp_path, variants=("one", "two"))
+    core_runtime.vad_failure = failed_identifier
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core"]) == 1
+    assert core_runtime.vad_calls == [1, 2, 3, 4, 3, 4]
+    failed_channel = "T" if failed_identifier == 1 else "R"
+    healthy_channel = "R" if failed_channel == "T" else "T"
+    for record in results_in(tmp_path):
+        failed = record.channels[failed_channel]
+        healthy = record.channels[healthy_channel]
+        assert failed.reference_vad_error == "test VAD failure"
+        assert failed.reference_active is None
+        assert failed.separated_vad_error is None
+        assert failed.separated_vad and failed.separated_utterances
+        assert failed.reference_utterances == ()
+        assert failed.activity.status == "failed"
+        assert healthy.activity.status == "scored"
+        assert healthy.metrics["stoi"].interval_results[0].status == "scored"
+        assert record.reference_overlap == ()
+        assert record.status == "failed"
+
+
+def test_metric_selection_resolves_once(tmp_path, core_runtime, monkeypatch) -> None:
+    """Pipeline construction owns selection expansion and preflight validation."""
+    from unittest.mock import Mock
+
+    resolve = Mock(wraps=pipeline._resolve_metrics)
+    monkeypatch.setattr(pipeline, "_resolve_metrics", resolve)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "core"]) == 0
+    resolve.assert_called_once_with(["core"])
+
+
+def test_both_vad_errors_survive_disabled_activity(tmp_path, core_runtime) -> None:
+    """Reference and output failures remain distinguishable in the same channel."""
+    write_triple(tmp_path)
+    core_runtime.vad_failure = (1, 3)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "stoi"]) == 1
+    (record,) = results_in(tmp_path)
+    target = record.channels["T"]
+    assert target.reference_vad_error == target.separated_vad_error == "test VAD failure"
+    assert target.activity.status == "disabled"
+    assert core_runtime.vad_calls == [1, 2, 3, 4]
+    assert record.channels["R"].separated_utterances
+    assert record.channels["R"].metrics["stoi"].interval_results[0].status == "scored"

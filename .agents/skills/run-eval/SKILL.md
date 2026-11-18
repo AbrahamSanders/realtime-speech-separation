@@ -53,59 +53,71 @@ The reference files are not used by `rtss.separate` during inference; they are o
 
 ## Run evaluation with the CLI
 
-After inference is complete, you can run evaluation using the CLI:
+Evaluation needs aligned mixture/reference/separated triples; it does not load
+enrollment audio, dataset metadata, dataset VAD, or separator resources.
 
 ```bash
-# Example: evaluate all mixture + separation + reference triples in `output/eval/dataset_magicodec_131k_60s_dev_metadata`
 rtss.eval \
     --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata \
+    --metrics core \
     --overwrite
 ```
-Use --overwrite if you need to overwrite existing evaluation outputs, e.g. if testing new changes that will affect metric calculations for the same input files.
-See `src/realtime_speech_separation/eval_cli.py` for all available command-line options and their descriptions.
 
-For each separation output, the evaluation metrics will be saved in a corresponding JSON file, e.g. `1_results_dcaf4f46.json`, `2_results_dcaf4f46.json`, and so on.
-The hash in the JSON filename matches the hash used in the corresponding separated output, ensuring that the evaluation results can be traced back to the exact inference arguments used.
+`--metrics all` (the default) requests the full protocol and rejects unavailable
+metrics. Use `core` for utterance and overlap SI-SDRi, activity, STOI, and STOIi,
+or select individual metrics, for example `--metrics si_sdri activity stoi`.
+Subsets are marked as partial protocol evaluations. See the
+[README](../../../README.md#evaluation-cli) for current availability and CLI usage.
 
-Once complete, summary statistics for the results will be saved in `input_dir/summary_<hash>.json`, where the hash matches the one used in the separated output and evaluation result filenames. A CSV file containing all the file-level metrics will also be saved at `input_dir/metrics_<hash>.csv`.
-
-The final file structure looks like:
-```
-input_dir/
-├── dataset_a/
-│   ├── 1.wav
-│   ├── 1_enrollment.wav
-│   ├── 1_reference.wav
-|   ├── 1_separated_dcaf4f46.wav
-|   ├── 1_results_dcaf4f46.json
-│   ├── 2.wav
-│   ├── 2_enrollment.wav
-│   ├── 2_reference.wav
-│   ├── 2_separated_dcaf4f46.wav
-│   ├── 2_results_dcaf4f46.json
-│   └── ...
-├── dataset_b/
-│   ├── 1.wav
-│   ├── 1_enrollment.wav
-│   ├── 1_reference.wav
-│   ├── 1_separated_dcaf4f46.wav
-│   ├── 1_results_dcaf4f46.json
-│   ├── 2.wav
-│   ├── 2_enrollment.wav
-│   ├── 2_reference.wav
-│   ├── 2_separated_dcaf4f46.wav
-│   ├── 2_results_dcaf4f46.json
-│   └── ...
-├── ...
-├── args_dcaf4f46.json
-├── metrics_dcaf4f46.csv
-└── summary_dcaf4f46.json
-```
+Use `--input_filter` to constrain processing and reports, including reused results.
+For development smoke tests, first copy triples to a temporary directory, then
+use `--input_filter` and `--overwrite` there. `--overwrite` recomputes results;
+otherwise reuse requires matching source hashes and evaluation configuration,
+structural compatibility, and no VAD, metric, speaker, or ASR backend failure.
+Undefined scores and ineligible intervals remain reusable. Summaries are rebuilt
+for the current selection. Nonzero exit status indicates invalid inputs,
+configuration errors, file I/O errors, or requested backend failures.
 
 ## Interpret the results
 
-The summary JSON file (`summary_<hash>.json`) contains aggregated statistics for all evaluated files, such as average metrics across the dataset.
-The metrics CSV file (`metrics_<hash>.csv`) contains file-level metrics for each separation output, allowing you to analyze performance on individual files.
+For inference hash `dcaf4f46`, evaluation identity `<evaluation_id>`, and an
+unfiltered selection, the output includes:
 
-You can use these files to understand the overall performance of your separation model and identify specific cases where it performs well or poorly.
-The evaluation protocol with metric definitions can be found in [docs/evaluation-protocol.md](../../../docs/evaluation-protocol.md).
+```text
+input_dir/
+├── dataset_a/
+│   ├── 1.wav
+│   ├── 1_reference.wav
+│   ├── 1_separated_dcaf4f46.wav
+│   └── 1_results_dcaf4f46_<evaluation_id>.json
+├── dataset_b/
+│   ├── 2.wav
+│   ├── 2_reference.wav
+│   ├── 2_separated_dcaf4f46.wav
+│   └── 2_results_dcaf4f46_<evaluation_id>.json
+├── args_dcaf4f46.json
+├── metrics_dcaf4f46_<evaluation_id>_all.csv
+└── summary_dcaf4f46_<evaluation_id>_all.json
+```
+
+Inference writes `args_<inference_hash>.json`. Evaluation results retain that hash
+and add an evaluation ID covering package version, selected metrics, settings,
+VAD/metric/speaker/ASR backend versions, and model digests. Source audio hashes
+are separate reuse keys. Filtered reports replace `all` with a selection digest
+and coexist with full-set reports; the summary records filter terms and selected
+mixture paths.
+
+Per-separation JSON contains source/configuration provenance, T/R availability,
+raw VAD intervals and utterances, separate reference/separated VAD errors,
+interval scores with statuses/reasons and paired improvement components,
+activity/edit counts, and missing-output diagnostics. Mono output is target-only;
+residual measurements are explicitly unavailable. Disabled metrics are explicit.
+
+Summary JSON pools interval scores and sums raw activity/edit counts before
+computing ratios. It includes distributions, metric-specific coverage and reasons,
+and processed/invalid/reused/failed recording counts. The CSV has one row per
+separation with channel statuses, scalar summaries, raw counts, and coverage;
+its recording means must not be averaged to reconstruct corpus scores.
+
+Metric definitions and aggregation rules live in the
+[evaluation protocol](../../../docs/evaluation-protocol.md).

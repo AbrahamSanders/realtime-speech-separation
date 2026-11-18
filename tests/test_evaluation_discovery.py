@@ -81,7 +81,7 @@ def test_invalid_inference_suffix(name: str) -> None:
 
 
 def test_cli_help_without_optional_runtime_stacks(capsys: pytest.CaptureFixture[str]) -> None:
-    """Help can describe triples before importing the legacy scoring backend."""
+    """Help can describe triples before importing optional runtime backends."""
     with pytest.raises(SystemExit) as exc:
         main(["--help"])
     assert exc.value.code == 0

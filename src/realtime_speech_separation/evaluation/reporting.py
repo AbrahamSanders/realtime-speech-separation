@@ -6,6 +6,7 @@ in the caller; summaries accept only the results reached through that selection.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -151,7 +152,9 @@ def parse_result(payload: str) -> RecordingResult:
 def has_failures(result: RecordingResult) -> bool:
     """Detect recording or metric/VAD/speaker/ASR backend errors; allow ineligibility."""
     return result.status != "processed" or any(
-        channel.activity.status == "failed"
+        channel.reference_vad_error is not None
+        or channel.separated_vad_error is not None
+        or channel.activity.status == "failed"
         or channel.wer.status == "failed"
         or channel.prototype.status == "failed"
         or any(item.status == "failed" for item in channel.prototype.extractions)
@@ -208,6 +211,81 @@ def write_result(path: Path, result: RecordingResult) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def result_path(mixture: Path, inference_hash: str, evaluation_id: str) -> Path:
+    """Name adjacent results using the mixture stem and complete inference suffix."""
+    return mixture.with_name(f"{mixture.stem}_results_{inference_hash}_{evaluation_id}.json")
+
+
+def _recording_row(result: RecordingResult) -> dict[str, object]:
+    """Flatten recording means/counts for CSV; corpus reports still pool intervals."""
+    row = {
+        "mixture": result.sources.mixture.path,
+        "separated": result.sources.separated.path,
+        "inference_hash": result.inference_hash,
+        "evaluation_id": result.evaluation_id,
+        "status": result.status,
+        "error_path": result.error.path if result.error else None,
+        "error_reason": result.error.reason if result.error else None,
+    }
+    for name in ("T", "R"):
+        channel = result.channels[name]
+        row[f"{name}_status"] = channel.status
+        row[f"{name}_reference_vad_error"] = channel.reference_vad_error
+        row[f"{name}_separated_vad_error"] = channel.separated_vad_error
+        row[f"{name}_reference_active"] = channel.reference_active
+        row[f"{name}_separated_missing_utterances"] = len(channel.separated_missing_utterances)
+        summary = _channel_summary([channel], [result.sample_count or 0])
+        for metric, measurements in summary["metrics"].items():
+            prefix = f"{name}_{metric}"
+            row[f"{prefix}_status"] = channel.metrics[metric].status
+            row[f"{prefix}_mean"] = measurements["distribution"]["mean"]
+            for key, value in measurements["coverage"].items():
+                if key != "reasons":
+                    row[f"{prefix}_{key}"] = value
+            for component in ("input_scores", "output_scores"):
+                if component in measurements:
+                    row[f"{prefix}_{component}_mean"] = measurements[component]["mean"]
+        for metric in ("activity", "wer"):
+            row[f"{name}_{metric}_status"] = getattr(channel, metric).status
+            row[f"{name}_{metric}_reason"] = getattr(channel, metric).reason
+            for key, value in summary[metric].items():
+                if not isinstance(value, dict):
+                    row[f"{name}_{metric}_{key}"] = value
+            for key, value in summary[metric]["coverage"].items():
+                row[f"{name}_{metric}_{key}"] = value
+    return row
+
+
+def write_reports(
+    input_dir: Path,
+    results: Sequence[RecordingResult],
+    *,
+    configuration: EvaluationConfig,
+    inference_hash: str,
+    filter_terms: Sequence[str] = (),
+    selected_mixtures: Sequence[str] = (),
+    cached_result_paths: Collection[str] = (),
+) -> None:
+    """Write selection-specific strict JSON and one CSV row per reached separation."""
+    summary = summarize_results(
+        results,
+        configuration=configuration,
+        inference_hash=inference_hash,
+        filter_terms=filter_terms,
+        selected_mixtures=selected_mixtures,
+        cached_result_paths=cached_result_paths,
+    )
+    suffix = f"{inference_hash}_{evaluation_identity(configuration)}_{selection_identity(filter_terms)}"
+    payload = strict_json_dumps(summary)
+    (input_dir / f"summary_{suffix}.json").write_text(payload, encoding="utf-8")
+    rows = [_recording_row(result) for result in results]
+    fieldnames = list(rows[0]) if rows else ["mixture", "separated", "inference_hash", "evaluation_id", "status"]
+    with (input_dir / f"metrics_{suffix}.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:

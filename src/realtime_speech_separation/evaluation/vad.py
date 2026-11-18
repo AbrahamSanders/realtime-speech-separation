@@ -188,16 +188,17 @@ def activity_counts(reference: NDArray[np.bool_], separated: NDArray[np.bool_]) 
 
 @dataclass(frozen=True)
 class ChannelSpeech:
-    """Prepared raw activity, utterances, and frame mask for one full channel."""
+    """Channel timing or an execution error; failed detection has no frame mask."""
 
     intervals: tuple[Interval, ...]
     utterances: tuple[SpeechRegion, ...]
-    frames: NDArray[np.bool_]
+    frames: NDArray[np.bool_] | None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
 class ReferenceSpeech:
-    """One recording's reusable reference timing; never share across mixtures."""
+    """Reusable reference timing and per-channel errors; never share across mixtures."""
 
     sample_count: int
     target: ChannelSpeech
@@ -207,7 +208,10 @@ class ReferenceSpeech:
 
 def _channel_speech(samples: NDArray[np.float32], detector: SpeechDetector) -> ChannelSpeech:
     """Prepare all timing populations from one independent full-channel VAD call."""
-    intervals = detector(samples)
+    try:
+        intervals = detector(samples)
+    except VadBackendError as exc:
+        return ChannelSpeech((), (), None, str(exc))
     frames = activity_mask(intervals, len(samples))
     frames.flags.writeable = False
     utterances = utterance_regions(intervals)
@@ -215,12 +219,15 @@ def _channel_speech(samples: NDArray[np.float32], detector: SpeechDetector) -> C
 
 
 def prepare_reference(reference: NDArray[np.float32], detector: SpeechDetector) -> ReferenceSpeech:
-    """Prepare validated (2, n) reference audio once for its inference variants."""
+    """Prepare both reference channels independently, retaining failures per channel."""
     if reference.ndim != 2 or reference.shape[0] != 2 or reference.shape[1] == 0:
         raise ValueError("Reference VAD requires nonempty (2, n) audio")
     target, residual = (_channel_speech(samples, detector) for samples in reference)
     sample_count = reference.shape[1]
-    overlap = overlap_regions(target.intervals, residual.intervals, sample_count)
+    # Overlap requires both reference populations; a failed channel is not silence.
+    overlap = ()
+    if target.error is None and residual.error is None:
+        overlap = overlap_regions(target.intervals, residual.intervals, sample_count)
     return ReferenceSpeech(sample_count, target, residual, overlap)
 
 
@@ -232,6 +239,9 @@ def prepare_separation(
     Return initial T/R records with VAD and activity populated. Missing R output
     has unavailable activity while retaining reference timing. Other metrics stay
     disabled for the pipeline to fill according to its selected configuration.
+    A separated-channel VAD failure produces failed activity on that channel;
+    reference timing and other channels remain usable for intrusive metrics.
+    Separated VAD runs even when reference VAD failed; activity requires both.
     """
     if separated.ndim != 2 or separated.shape[0] not in (1, 2) or separated.shape[1] != reference.sample_count:
         raise ValueError("Separated VAD requires (1, n) or (2, n) audio matching the reference length")
@@ -240,14 +250,20 @@ def prepare_separation(
     for index, (channel, original) in enumerate((("T", reference.target), ("R", reference.residual))):
         available = index < separated.shape[0]
         output = _channel_speech(separated[index], detector) if available else None
-        if output is not None:
+        if not available:
+            activity = ActivityResult("unavailable", reason="missing_output_channel")
+        elif original.error is not None:
+            activity = ActivityResult("failed", reason=f"reference_vad_backend_error: {original.error}")
+        elif output.error is not None:
+            activity = ActivityResult("failed", reason=f"separated_vad_backend_error: {output.error}")
+        else:
             counts = activity_counts(original.frames, output.frames)
             activity = ActivityResult("scored", counts)
-        else:
-            activity = ActivityResult("unavailable", reason="missing_output_channel")
         channels[channel] = ChannelResult(
             status="available" if available else "unavailable",
-            reference_active=bool(original.intervals),
+            reference_vad_error=original.error,
+            separated_vad_error=output.error if output is not None else None,
+            reference_active=bool(original.intervals) if original.error is None else None,
             reference_vad=original.intervals,
             reference_utterances=original.utterances,
             separated_vad=output.intervals if output is not None else (),

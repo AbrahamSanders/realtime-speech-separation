@@ -421,6 +421,8 @@ class ChannelResult:
         reference_active: Activity from raw VAD, independent of utterance eligibility.
             False means no speech was detected anywhere in this reference channel;
             None means VAD was not obtained.
+        reference_vad_error: Reference VAD failure, retained when activity is disabled.
+        separated_vad_error: Separated VAD failure, independent of reference detection.
         reference_vad: Raw speech intervals detected across the full reference channel.
         separated_vad: Raw speech intervals detected across the full separated channel.
         reference_utterances: Reference speech regions after merging and duration filtering.
@@ -438,6 +440,8 @@ class ChannelResult:
 
     status: Literal["available", "unavailable"] = "available"
     reference_active: bool | None = None
+    reference_vad_error: str | None = None
+    separated_vad_error: str | None = None
     reference_vad: tuple[Interval, ...] = ()
     separated_vad: tuple[Interval, ...] = ()
     reference_utterances: tuple[SpeechRegion, ...] = ()

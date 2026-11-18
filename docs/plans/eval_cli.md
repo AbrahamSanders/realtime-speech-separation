@@ -1,7 +1,7 @@
 # Evaluation CLI implementation plan
 
-Status: Stages 1–3 implemented; protocol pipeline integration and metric,
-speaker, and ASR backends remain planned.
+Status: Stages 1–4 implemented; additional quality metrics, speaker, and ASR
+backends remain planned.
 
 ## Objective and scope
 
@@ -516,6 +516,109 @@ references, valid zero STOI, and unavailable baselines. Keep one real SI-SDR
 sanity check that mixture-as-estimate gives zero improvement in an opt-in SI-SDR metric-backend
 test. Start a synthetic CLI fixture with fake VAD/metrics, then extend it through
 later stages. Cover shared resource preflight and failure isolation once.
+
+**Implementation notes:**
+
+- Added [`metrics.py`](../../src/realtime_speech_separation/evaluation/metrics.py)
+  and [`pipeline.py`](../../src/realtime_speech_separation/evaluation/pipeline.py).
+  Functional SI-SDR uses CPU float32 tensors and explicit `zero_mean=True`;
+  provenance records the metric backend's epsilon and placement. Assumption:
+  test exact centered silence in float64 without squaring, avoiding mean-rounding
+  artifacts for constant float32 signals and underflow for quiet varying signals.
+  Actual scoring retains TorchMetrics' float32 centering and stabilization.
+  Reference zero energy is ineligible for SI-SDR; separated zero energy and
+  mixture zero energy make their respective absolute scores undefined.
+- Classical STOI passes reference first, at 16 kHz with `extended=False`.
+  Assumption: pystoi's documented insufficient-STFT-frame warning means
+  `ineligible/insufficient_stoi_frames`; identify it by warning text, never by the
+  returned sentinel or a zero score. Other warnings retain normal handling.
+  A missing baseline leaves valid absolute output scores intact, with undefined
+  improvement for valid unavailability or failed improvement for a backend
+  failure. Nonfinite scores fail locally; unexpected programming errors propagate.
+- The pipeline slices all waveforms at identical reference bounds, preserves
+  T/R identity, and reuses reference VAD and per-family/channel/interval mixture
+  baselines across inference variants of one mixture. STOI/STOIi share calls, as
+  do SI-SDR conditions when bounds coincide. Short unpaddable overlap candidates
+  remain explicit ineligible records. Missing-utterance diagnostics inspect
+  centered separated waveforms independently of separated VAD or metric selection.
+- Assumption: `core` includes both `si_sdri` and `overlap_si_sdri`, plus `activity`,
+  `stoi`, and `stoii`. Individual choices use schema metric names; combinations
+  are deduplicated. `all` still means the full protocol and remains the default,
+  so it currently fails with an explicit list of unimplemented metrics. Users
+  must select `--metrics core` or implemented individual metrics until later
+  stages land. All supported subsets are labeled partial evaluations in logs
+  and persisted configuration. The README now shows the runnable core command.
+- Preflight initializes each selected metric adapter and packaged Silero model
+  once, before processing or writing results, with lazy optional imports, CPU
+  execution, no downloads, and no RTSS thread configuration. Activity-only runs
+  do not import metric runtimes. Reference and separated VAD run independently
+  on every available channel, retaining `reference_vad_error` and
+  `separated_vad_error` even when activity is disabled. A reference-channel
+  failure leaves its speech populations unknown and prevents overlap construction;
+  healthy reference channels still support intrusive scoring. Separated utterances
+  remain available for future DNSMOS scoring despite reference VAD failures.
+  Any VAD failure makes the invocation fail and prevents result reuse. Regression
+  tests cover either reference channel failing across inference variants and both
+  reference/separated errors persisting together with activity disabled.
+  Metric selection is resolved once inside pipeline construction; `_score_channel`
+  receives only reference overlap regions in addition to its prepared channel.
+- Source SHA-256/path validity keys, native audio metadata, resolved settings,
+  backend versions, and packaged VAD model digest now reach persistent results.
+  Reuse delegates to Stage 1's structural/configuration/source checks. Stale,
+  malformed, failed, and invalid results are recomputed; undefined/ineligible
+  outcomes are reusable. `--overwrite` bypasses reuse. Cached-path bookkeeping
+  belongs only to the current invocation and never modifies persisted results.
+- The CLI now writes atomic per-separation JSON and pooled JSON/recording CSV
+  reports with evaluation and selection IDs, including cached results reached
+  through current discovery only. Full-set and filtered reports coexist. Invalid
+  triples retain relative error paths and reasons, continue to later inputs,
+  and contribute invalid counts. Empty selections log a diagnostic; known hashes
+  still get reports for all-invalid or empty-candidate runs. Configuration,
+  file-I/O, and requested backend failures return nonzero; valid mathematical
+  unavailability does not. The legacy rate flag only accepts 16000 and permutation
+  matching is rejected.
+- Naming assumption: each directory has unique mixture stems and each mixture
+  has at most one separated audio file per inference suffix, regardless of
+  extension. Ambiguities are rejected to prevent result-file collisions. Result
+  files use the mixture stem directly rather than replacing marker text anywhere
+  in a path. CSV column order stays fixed between fresh and cached runs.
+- Replaced Asteroid/pandas in `eval` with explicit `torch>=2.2`,
+  `torchmetrics>=1.8.2`, `pystoi>=0.4.1`, and the existing Silero requirement.
+  TorchMetrics 1.8.2 requires Python >=3.9; pystoi 0.4.1 supplies a Python wheel
+  without a narrower Python requirement. Both were checked on local Python 3.12;
+  base/dev and unrelated extras are unchanged. References:
+  [functional SI-SDR](https://github.com/Lightning-AI/torchmetrics/blob/v1.8.2/src/torchmetrics/functional/audio/sdr.py),
+  [pystoi warning/API](https://github.com/mpariente/pystoi/blob/v0.4.1/pystoi/stoi.py).
+- Replaced the legacy CLI fixture with synthetic end-to-end offline tests using
+  injected resources. These cover channel assignment, exact slices and paired
+  scores, baseline/resource reuse, cache invalidation/overwrite, filtered cached
+  reports, target-only output, missing/silent audio, zero candidate populations,
+  short overlap eligibility, unavailable metric selections, preflight failures,
+  and failure isolation/retry. Adapter tests cover argument order, float32 SI-SDR,
+  centered silence/quiet output, real zero STOI, warning mapping, nonfinite
+  scores, unavailable baselines, and visible programming errors. The isolated
+  import test now includes both new modules. The real SI-SDR test is CPU-only and
+  opt-in via `RTSS_TEST_METRIC_BACKENDS=1` and pytest's `metric_backend` marker.
+
+**Checks:** in the `audio` environment on Python 3.12.13,
+`python -m ruff check .`, `python -m ruff format --check .`,
+`python -m pytest` (187 passed, one opt-in test skipped), and `git diff --check`
+passed. The skipped real CPU SI-SDR sanity test passed when explicitly enabled
+with `RTSS_TEST_METRIC_BACKENDS=1` and `-m metric_backend`. A temporary synthetic
+target-only silence triple passed actual-resource core CLI evaluation, strict
+JSON reporting, and cached rerun. A separate installed pystoi call confirmed the
+short-input warning mapping. Runtime versions were TorchMetrics 1.8.2, pystoi
+0.4.1, PyTorch 2.13.0, Silero 6.2.1, NumPy 2.4.6, and SciPy 1.17.1. Pytest emitted
+the existing AnyIO plugin and three audioread deprecation warnings. No source
+data, enrollment, metadata, separator resources, model-asset downloads, or GPU
+were used. No checks were blocked.
+
+**Deviations:** basic report writing, empty-run handling, and filtered-cache
+integration checks were brought forward from Stage 10 so the replacement CLI is
+usable and reviewable now. Full-protocol integration, additional metric adapters,
+and remaining output-consumer/native-setup documentation stay in their owning
+stages. The run-eval skill now documents metric selection and the result/report
+formats. No metric definitions changed.
 
 ### Stage 5 — Add PESQ
 

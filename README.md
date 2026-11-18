@@ -73,8 +73,31 @@ After inference is complete, you can run evaluation using the CLI:
 ```bash
 # Example: evaluate all mixture + separation + reference triples in `output/eval/dataset_magicodec_131k_60s_dev_metadata`
 rtss.eval \
-    --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata
+    --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata \
+    --metrics core
 ```
+
+`core` runs a partial evaluation: utterance and overlap SI-SDRi, speech activity,
+STOI, and STOI improvement. Select individual metrics with, for example,
+`--metrics si_sdri activity stoi`. The default `--metrics all` requests the full
+[protocol](docs/evaluation-protocol.md). Requested metrics never fall back silently.
+
+Evaluation uses the supplied mixture, reference, and separated audio and packaged
+Silero VAD on CPU. Enrollment and dataset metadata are unnecessary. Channels keep
+their target/residual assignment; target-only output is supported. Audio is
+resampled to 16 kHz and must then have equal lengths and already be aligned.
+
+Per-separation results are written beside the mixture as
+`<file_id>_results_<inference_hash>_<evaluation_id>.json`. Reports in `input_dir`
+are named `summary_<inference_hash>_<evaluation_id>_<selection_id>.json` and
+`metrics_<inference_hash>_<evaluation_id>_<selection_id>.csv`. The evaluation ID
+identifies settings and runtime/model versions; the selection ID is `all` or a
+filter digest. Summaries pool interval scores and activity counts; the CSV has
+one row per separation. Dataset-filtered reports coexist with full-set reports.
+Results are reused only when the source content and configuration match and no
+VAD, metric, speaker, or ASR backend failed. Invalid inputs and failures in any
+of these backends return a nonzero exit status. Undefined scores and ineligible
+intervals retain explicit reasons and coverage.
 
 ### Usage Notes
 
