@@ -38,6 +38,8 @@
   before passing them to another function; do not nest these calls as arguments.
 - Add dependencies when a feature needs them. Take adavantage of established
   libraries and packages when available, rather than re-inventing routines from scratch.
+- Specify minimum compatible dependency versions instead of version pins. Add upper bounds 
+  only when compatibility requires them. Use version ranges in dependency declarations.
 - Use comments sparingly - comment only when the code contains non-obvious assumptions
   or readibility would benefit from the motivation of a specific decision. Always comment:
   * The main steps of any process or algorithm

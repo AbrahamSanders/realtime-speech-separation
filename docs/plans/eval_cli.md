@@ -1,7 +1,7 @@
 # Evaluation CLI implementation plan
 
-Status: Stages 1–4 implemented; additional quality metrics, speaker, and ASR
-backends remain planned.
+Stages 1–5 are implemented. ViSQOL, DNSMOS, speaker, and ASR backends remain
+planned.
 
 ## Objective and scope
 
@@ -65,7 +65,7 @@ backend detects speech (Silero), the speaker backend extracts embeddings
 | WER | `jiwer.process_words`, JiWER 4+. | Retain edit counts, including insertions against empty references. [Usage](https://jitsi.github.io/jiwer/usage/). |
 | Intervals, activity, cosine, aggregation | Small NumPy/Python helpers. | Reuse libraries for signal metrics, features, neural inference, and edit distance. |
 
-Use `eval` for Silero/TorchMetrics/pystoi, `eval-quality` for PESQ/DNSMOS,
+Use `eval` for Silero/TorchMetrics/pystoi/PESQ and the planned DNSMOS dependencies,
 `eval-speaker` for the speaker frontend, and `eval-asr` for pywhispercpp/JiWER.
 The latter extras include `eval`. Document ViSQOL native setup separately.
 Replace Asteroid when core metrics land; retain pandas only if reporting uses it.
@@ -639,13 +639,47 @@ formats. No metric definitions changed.
 
 ### Stage 5 — Add PESQ
 
-- Add wideband PESQ over reference utterances and include it in `eval-quality`.
+- Add wideband PESQ over reference utterances and include it in `eval`.
   Document native setup and resolved Python/NumPy compatibility.
 - Map documented no-utterance/too-short exceptions to interval-result reasons using
   the selected exception mode.
 
 **Tests:** verify PESQ arguments and exception mapping with a fake PESQ metric backend.
 An opt-in wrapper smoke test checks a valid signal and documented error cases.
+
+**Implementation notes**
+
+- `--metrics pesq` scores the separated and reference channel at identical
+  reference-utterance bounds using 16 kHz wideband mode and
+  `PesqError.RAISE_EXCEPTION`. `--metrics core pesq` combines PESQ with core
+  metrics. PESQ settings and the installed wrapper version are part of the
+  evaluation ID. The adapter accepts an injected scoring callable for tests and
+  defaults to the native callable. The existing interval reporting and cache
+  rules apply.
+- The implementation assumes `BufferTooShortError` and `NoUtterancesError` mean
+  the interval is ineligible for PESQ, with reasons `pesq_buffer_too_short` and
+  `pesq_no_utterances`. They retain a candidate with a null value. Other typed
+  PESQ exceptions are scoring failures. Version 0.0.4 can also raise
+  `ValueError` when it tries to convert a native NaN to an integer error code,
+  as observed with silent and very quiet estimates. That exact error uses the
+  same `failed/nonfinite_score` result as a nonfinite return. Other `ValueError`s
+  propagate. [PESQ exception implementation](https://github.com/ludlows/PESQ/blob/v0.0.4/pesq/cypesq.pyx)
+- The `eval` extra sets `pesq>=0.0.4`. PyPI publishes the tested release as source
+  with no Python version constraint. An isolated build succeeded on Linux with
+  CPython 3.12.13, and its wheel passed the native
+  smoke test with NumPy 1.26.4 and 2.4.6. Pip resolved NumPy and Cython wheels for
+  the CI versions, Python 3.11 and 3.14. Native execution was verified on Python
+  3.12. [PyPI release](https://pypi.org/project/pesq/0.0.4/)
+  [Native build requirements](https://github.com/ludlows/PESQ/blob/v0.0.4/setup.py)
+  [Installation and CLI usage](../../README.md#pesq-setup)
+
+**Checks**
+
+Ruff lint and formatting, `git diff --check`, and pytest passed on Python 3.12.13
+(207 passed, two opt-in tests skipped). Both opt-in metric tests passed when
+enabled. A CPU CLI smoke test on synthetic speech verified per-channel PESQ,
+JSON and CSV reports, cache reuse, and preservation of the residual score when
+the silent target estimate produced a nonfinite result and a nonzero exit code.
 
 ### Stage 6 — Add ViSQOL
 
@@ -661,7 +695,7 @@ opt-in smoke test to establish native short-utterance behavior.
 
 ### Stage 7 — Add DNSMOS-P.808
 
-- Add the TorchMetrics adapter and CPU ONNX Runtime/requests to `eval-quality`.
+- Add the TorchMetrics adapter and CPU ONNX Runtime/requests to `eval`.
   Select only `p808_mos`, preserving the library's short-input extension and
   internal-window averaging rather than adding an utterance-duration cutoff.
 - Document and checksum all assets needed by the selected API, including any

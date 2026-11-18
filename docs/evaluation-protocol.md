@@ -215,6 +215,10 @@ Perceptual Evaluation of Speech Quality (PESQ) measures the perceived audio qual
 Short-Time Objective Intelligibility (STOI) measures the intelligibility of the separated channels compared to the reference channels.
 Virtual Speech Quality Objective Listener (ViSQOL) measures the perceived audio quality of the separated channels compared to the reference channels.
 
+Use wideband PESQ at 16 kHz and report its MOS-LQO score. Record short buffers
+and reference utterances where PESQ detects no usable speech as ineligible
+intervals, with a reason for each exclusion.
+
 We measure:
 
 1. Target PESQ, STOI, ViSQOL: Scores between the Separated and Reference T channel for each reference T channel utterance.

@@ -1,4 +1,4 @@
-"""Lazy CPU SI-SDR and STOI adapters for validated, aligned interval waveforms."""
+"""Lazy CPU metric adapters for validated, aligned interval waveforms."""
 
 import warnings
 from collections.abc import Callable
@@ -113,5 +113,44 @@ class Stoi:
         except RuntimeWarning as exc:
             if str(exc).startswith("Not enough STFT frames"):
                 return MetricScore("ineligible", reason="insufficient_stoi_frames")
+            raise
+        return finite_score(score)
+
+
+class Pesq:
+    """Wideband PESQ MOS-LQO for aligned mono float32 reference and estimate slices.
+
+    Unusable reference speech and short buffers are ineligible. Native scoring
+    errors and nonfinite scores are failed outcomes.
+    """
+
+    def __init__(self, call: Callable | None = None) -> None:
+        """Resolve the PESQ function and typed errors; allow injected calls in tests."""
+        import pesq
+
+        if call is None:
+            call = pesq.pesq
+        self._call = call
+        self._backend = pesq
+        self.versions = {"pesq": version("pesq")}
+        self.parameters = {"sample_rate": EVALUATION_SAMPLE_RATE, "mode": "wb", "on_error": "raise_exception"}
+
+    def __call__(self, reference: NDArray[np.float32], estimate: NDArray[np.float32]) -> MetricScore:
+        """Score a reference utterance using the wrapper's typed error mode."""
+        backend = self._backend
+        try:
+            score = self._call(
+                EVALUATION_SAMPLE_RATE, reference, estimate, mode="wb", on_error=backend.PesqError.RAISE_EXCEPTION
+            )
+        except backend.BufferTooShortError:
+            return MetricScore("ineligible", reason="pesq_buffer_too_short")
+        except backend.NoUtterancesError:
+            return MetricScore("ineligible", reason="pesq_no_utterances")
+        except backend.PesqError as exc:
+            return MetricScore("failed", reason=f"pesq_backend_error: {exc}")
+        except ValueError as exc:
+            # pesq 0.0.4 tries to decode a native NaN as an integer error code.
+            if str(exc) == "cannot convert float NaN to integer":
+                return MetricScore("failed", reason="nonfinite_score")
             raise
         return finite_score(score)

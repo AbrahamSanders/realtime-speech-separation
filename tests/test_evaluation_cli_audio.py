@@ -65,6 +65,7 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(pipeline, "SileroVad", Detector)
     monkeypatch.setattr(pipeline, "SiSdr", lambda: adapter_factory("si_sdr"))
     monkeypatch.setattr(pipeline, "Stoi", lambda: adapter_factory("stoi"))
+    monkeypatch.setattr(pipeline, "Pesq", lambda: adapter_factory("pesq"))
     return state
 
 
@@ -244,7 +245,37 @@ def test_cli_continues_after_invalid_audio(tmp_path, core_runtime, caplog) -> No
     assert summary["recordings"]["invalid"] == summary["recordings"]["processed"] == 1
 
 
-@pytest.mark.parametrize("selection", [[], ["--metrics", "all"], ["--metrics", "pesq"], ["--metrics", "core", "wer"]])
+@pytest.mark.parametrize("channels", [1, 2])
+def test_cli_selects_pesq_and_reports_absolute_reference_utterance_scores(tmp_path, core_runtime, channels) -> None:
+    """Score only the selected family, with matching reference and output bounds."""
+    write_triple(tmp_path, channels=channels)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "pesq"]) == 0
+    assert core_runtime.loads == {"vad": 1, "pesq": 1}
+    (record,) = results_in(tmp_path)
+    assert record.configuration.metrics == ("pesq",)
+    assert record.configuration.metric_backend_versions["pesq"] == "test"
+    for channel, interval, value in (("T", Interval(0, 10000), 31), ("R", Interval(6000, 16000), 42.825)):
+        metric = record.channels[channel].metrics["pesq"]
+        if channel not in record.output_channels:
+            assert metric.status == "unavailable"
+            assert not metric.interval_results
+            continue
+        (score,) = metric.interval_results
+        assert score.interval == interval
+        assert score.interval_source == "reference_utterance"
+        assert score.value == pytest.approx(value, abs=0.001)
+        assert score.input_score is score.output_score is None
+    assert len(core_runtime.scores) == channels
+    (summary_file,) = tmp_path.glob("summary_*.json")
+    summary = json.loads(summary_file.read_text())
+    assert summary["channels"]["T"]["metrics"]["pesq"]["distribution"]["mean"] == 31
+    (csv_file,) = tmp_path.glob("metrics_*.csv")
+    with csv_file.open(newline="") as stream:
+        (row,) = csv.DictReader(stream)
+    assert row["T_pesq_mean"] == "31.0"
+
+
+@pytest.mark.parametrize("selection", [[], ["--metrics", "all"], ["--metrics", "visqol"], ["--metrics", "core", "wer"]])
 def test_unimplemented_selections_fail_before_preflight(tmp_path, core_runtime, selection, caplog) -> None:
     """All remains the full protocol and cannot silently fall back to core."""
     assert main(["--input_dir", str(tmp_path), *selection]) == 1

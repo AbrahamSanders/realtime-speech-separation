@@ -1,4 +1,4 @@
-"""Core metric adapter contracts with injected functions; native SI-SDR is opt-in."""
+"""Metric adapter contracts with fake runtimes and opt-in native smoke tests."""
 
 import os
 import sys
@@ -105,6 +105,78 @@ def test_other_stoi_warnings_and_programming_errors_escape(fake_runtime: None) -
         metrics.Stoi(Mock(side_effect=ValueError("bug")))(samples, samples)
 
 
+@pytest.fixture
+def fake_pesq(monkeypatch: pytest.MonkeyPatch, fake_runtime: None) -> SimpleNamespace:
+    """Expose the wrapper's callable and exception hierarchy without loading native code."""
+
+    class PesqError(RuntimeError):
+        """Match the wrapper's base exception and error-mode constant."""
+
+        RAISE_EXCEPTION = 0
+
+    class BufferTooShortError(PesqError):
+        """Represent an unsupported buffer duration."""
+
+    class NoUtterancesError(PesqError):
+        """Represent the lack of a detectable utterance."""
+
+    backend = SimpleNamespace(
+        pesq=Mock(return_value=np.float32(3.25)),
+        PesqError=PesqError,
+        BufferTooShortError=BufferTooShortError,
+        NoUtterancesError=NoUtterancesError,
+    )
+    monkeypatch.setitem(sys.modules, "pesq", backend)
+    return backend
+
+
+@pytest.mark.parametrize("inject_call", [False, True])
+def test_pesq_wideband_arguments_and_provenance(fake_pesq: SimpleNamespace, inject_call: bool) -> None:
+    """Pass unmodified mono waveform slices to the wideband exception-mode API."""
+    reference = np.linspace(-1, 1, 8000, dtype=np.float32)
+    estimate = reference[::-1]
+    call = Mock(return_value=np.float32(3.25)) if inject_call else fake_pesq.pesq
+    adapter = metrics.Pesq(call if inject_call else None)
+    assert adapter(reference, estimate) == metrics.MetricScore("scored", 3.25)
+    sample_rate, ref_arg, est_arg = call.call_args.args
+    assert sample_rate == 16000 and ref_arg is reference and est_arg is estimate
+    assert call.call_args.kwargs == {"mode": "wb", "on_error": fake_pesq.PesqError.RAISE_EXCEPTION}
+    if inject_call:
+        fake_pesq.pesq.assert_not_called()
+    assert adapter.parameters == {"sample_rate": 16000, "mode": "wb", "on_error": "raise_exception"}
+    assert adapter.versions == {"pesq": "test"}
+
+
+@pytest.mark.parametrize(
+    ("error_type", "status", "reason"),
+    [
+        ("BufferTooShortError", "ineligible", "pesq_buffer_too_short"),
+        ("NoUtterancesError", "ineligible", "pesq_no_utterances"),
+        ("PesqError", "failed", "pesq_backend_error: native error"),
+    ],
+)
+def test_pesq_typed_native_errors(fake_pesq: SimpleNamespace, error_type: str, status: str, reason: str) -> None:
+    """Keep documented eligibility exclusions distinct from scoring failures."""
+    samples = np.arange(8000, dtype=np.float32)
+    fake_pesq.pesq.side_effect = getattr(fake_pesq, error_type)("native error")
+    assert metrics.Pesq()(samples, samples) == metrics.MetricScore(status, reason=reason)
+
+
+def test_pesq_nonfinite_scores_and_unexpected_errors(fake_pesq: SimpleNamespace) -> None:
+    """Handle the wrapper's native NaN conversion failure while exposing other bugs."""
+    samples = np.arange(8000, dtype=np.float32)
+    adapter = metrics.Pesq()
+    failed = metrics.MetricScore("failed", reason="nonfinite_score")
+    for value in (np.nan, np.inf, -np.inf):
+        fake_pesq.pesq.return_value = value
+        assert adapter(samples, samples) == failed
+    fake_pesq.pesq.side_effect = ValueError("cannot convert float NaN to integer")
+    assert adapter(samples, samples) == failed
+    fake_pesq.pesq.side_effect = ValueError("unexpected error")
+    with pytest.raises(ValueError, match="unexpected error"):
+        adapter(samples, samples)
+
+
 @pytest.mark.parametrize(
     ("baseline", "status", "input_score"),
     [
@@ -137,3 +209,22 @@ def test_real_si_sdr_mixture_as_estimate_has_zero_improvement() -> None:
     result = _interval_result(Interval(0, 16000), "reference_utterance", output, baseline)
     assert result.status == "scored"
     assert result.value == 0
+
+
+@pytest.mark.metric_backend
+@pytest.mark.skipif(os.environ.get("RTSS_TEST_METRIC_BACKENDS") != "1", reason="opt-in installed metric backends")
+def test_real_pesq_scores_signal_and_reports_native_exceptions() -> None:
+    """Exercise the native wrapper using a deterministic modulated signal."""
+    rng = np.random.default_rng(42)
+    time = np.arange(32000) / 16000
+    envelope = np.maximum(np.sin(2 * np.pi * 3 * time), 0)
+    carrier = np.sin(2 * np.pi * 190 * time) + 0.3 * rng.standard_normal(time.size)
+    signal = (envelope * carrier).astype(np.float32)
+    silence = np.zeros_like(signal)
+    adapter = metrics.Pesq()
+    score = adapter(signal, signal.copy())
+    assert score.status == "scored"
+    assert score.value == pytest.approx(4.64, abs=0.02)
+    assert adapter(signal[:3200], signal[:3200]) == metrics.MetricScore("ineligible", reason="pesq_buffer_too_short")
+    assert adapter(silence, signal) == metrics.MetricScore("ineligible", reason="pesq_no_utterances")
+    assert adapter(signal, silence) == metrics.MetricScore("failed", reason="nonfinite_score")

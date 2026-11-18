@@ -41,7 +41,7 @@ Install the extras needed for your workflow:
 ```bash
 python -m pip install -e '.[inference]'  # rtss.separate
 python -m pip install -e '.[client]'     # rtss.client (includes inference)
-python -m pip install -e '.[eval]'       # rtss.eval
+python -m pip install -e '.[eval]'       # rtss.eval, including wideband PESQ
 python -m pip install -e '.[training]'   # scripts/training
 python -m pip install -e '.[data]'       # scripts/data_prep and scripts/eval_prep
 ```
@@ -100,6 +100,17 @@ of these backends return a nonzero exit status. Undefined scores and ineligible
 intervals retain explicit reasons and coverage. Each channel measurement also
 reports recording participation and error exclusions with reason counts; partial
 interval failures preserve the remaining scores.
+
+#### PESQ setup
+
+The `eval` extra includes the native `pesq` wrapper. Building PESQ from PyPI
+requires a C compiler and Python development headers. Pip's
+isolated build installs Cython and NumPy for the extension. For tested Python
+and NumPy versions, see the
+[Stage 5 implementation notes](docs/plans/eval_cli.md#stage-5--add-pesq).
+
+Select PESQ with `--metrics pesq` or add it to the core metrics with
+`--metrics core pesq`.
 
 ### Usage Notes
 
