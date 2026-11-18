@@ -220,10 +220,11 @@ and reference utterances where PESQ detects no usable speech as ineligible
 intervals, with a reason for each exclusion.
 
 Use ViSQOL in 16 kHz speech mode with the speech lattice model and report its
-MOS-LQO score. Reference utterance spans shorter than two seconds are ineligible.
+MOS-LQO score. Require at least three seconds of detected speech in the reference
+utterance, excluding merged gaps.
 For eligible spans, take at most the first nine seconds at identical bounds in
 the reference and separated signals. Add 0.5 seconds of silence to each end of
-both signals, yielding inputs of three to ten seconds. Report candidates at their
+both signals, yielding inputs of four to ten seconds. Report candidates at their
 original reference utterance bounds.
 
 We measure:
@@ -251,9 +252,10 @@ This reporting convention is used in
 
 DNSMOS measures the perceptual quality of the separated channels using a deep neural network-based model.
 
-Report the non-personalized P.808 MOS at 16 kHz. Pass each full separated VAD
-utterance to TorchMetrics, which repeats audio shorter than its analysis window
-and averages internal window scores into one score per utterance.
+Report the non-personalized P.808 MOS at 16 kHz. Require at least three seconds
+of detected speech in the separated utterance, excluding merged gaps. Pass each
+eligible span in full to TorchMetrics, which repeats audio shorter than its
+analysis window and averages internal window scores into one score per utterance.
 
 We measure:
 

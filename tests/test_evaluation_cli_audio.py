@@ -15,7 +15,11 @@ from realtime_speech_separation.evaluation import pipeline
 from realtime_speech_separation.evaluation.metrics import MetricScore
 from realtime_speech_separation.evaluation.reporting import parse_result, result_path
 from realtime_speech_separation.evaluation.types import Interval
-from realtime_speech_separation.evaluation.vad import VadBackendError
+from realtime_speech_separation.evaluation.vad import (
+    OVERLAP_MIN_ACTIVE_SAMPLES,
+    UTTERANCE_MIN_ACTIVE_SAMPLES,
+    VadBackendError,
+)
 
 
 @pytest.fixture
@@ -28,6 +32,8 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         metric_failure=False,
         vad_failure=None,
         separated_timing={},
+        vad_intervals={},
+        metric_parameters={},
         visqol_model_digest="model-a",
         dnsmos_model_digests={"dnsmos/model_v8.onnx": "p808-a", "dnsmos/sig_bak_ovr.onnx": "companion-a"},
         dnsmos_scores=[],
@@ -52,6 +58,8 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             failures = state.vad_failure if isinstance(state.vad_failure, tuple) else (state.vad_failure,)
             if identifier in failures:
                 raise VadBackendError("test VAD failure")
+            if identifier in state.vad_intervals:
+                return state.vad_intervals[identifier]
             if identifier == 0:
                 return ()
             default = (0, 10000) if identifier in (1, 3) else (6000, 16000)
@@ -71,6 +79,9 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
         score.versions = {family: "test"}
         score.parameters = {"test": True}
+        if family == "si_sdr":
+            score.parameters["min_active_samples"] = OVERLAP_MIN_ACTIVE_SAMPLES
+        score.parameters.update(state.metric_parameters.get(family, {}))
         if family == "visqol":
             score.model_digest = state.visqol_model_digest
         return score
@@ -85,7 +96,7 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             return MetricScore("scored", float(estimate[0]))
 
         score.versions = {"onnxruntime": "test"}
-        score.parameters = {"test": True}
+        score.parameters = {"test": True, **state.metric_parameters.get("dnsmos_p808", {})}
         score.model_digests = state.dnsmos_model_digests.copy()
         return score
 
@@ -98,11 +109,13 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return state
 
 
-def write_triple(root: Path, name: str = "call_name", channels: int = 2, variants=("config_with_suffix",)) -> Path:
+def write_triple(
+    root: Path, name: str = "call_name", channels: int = 2, variants=("config_with_suffix",), sample_count: int = 16000
+) -> Path:
     """Write float WAVs with identifiable T/R, mixture, and separated samples."""
     mixture_file = root / f"{name}.wav"
     mixture_file.parent.mkdir(parents=True, exist_ok=True)
-    ramp = np.linspace(0, 0.2, 16000, dtype=np.float32)
+    ramp = np.linspace(0, 0.2, sample_count, dtype=np.float32)
     reference = np.stack((1 + ramp, 2 + ramp), axis=1)
     separated = np.stack((3 + ramp, 4 + ramp), axis=1)[:, :channels]
     sf.write(mixture_file, 5 + ramp, 16000, subtype="FLOAT")
@@ -133,7 +146,11 @@ def test_cli_loads_and_scores_triple_without_enrollment(tmp_path, core_runtime, 
     assert not (tmp_path / "call_name_enrollment.wav").exists()
     target = record.channels["T"]
     assert target.metrics["si_sdri"].interval_results[0].interval == Interval(0, 10000)
-    assert target.metrics["overlap_si_sdri"].interval_results[0].interval == Interval(4000, 12000)
+    (overlap,) = target.metrics["overlap_si_sdri"].interval_results
+    assert overlap.interval == Interval(4000, 12000)
+    assert overlap.status == "scored"
+    assert record.configuration.parameters["si_sdr"]["min_active_samples"] == OVERLAP_MIN_ACTIVE_SAMPLES
+    assert record.configuration.parameters["stoi"]["min_active_samples"] == UTTERANCE_MIN_ACTIVE_SAMPLES
     assert target.activity.counts.tp == 6
     for _family, reference, estimate in core_runtime.scores:
         assert reference.dtype == estimate.dtype == np.float32
@@ -385,6 +402,39 @@ def test_dnsmos_companion_digest_controls_result_reuse(tmp_path, core_runtime) -
     assert len({record.evaluation_id for record in results_in(tmp_path)}) == 2
 
 
+@pytest.mark.parametrize(("metric", "vad_identifier"), [("visqol", 1), ("dnsmos_p808", 3)])
+def test_cli_checks_detected_activity_before_scoring(tmp_path, core_runtime, metric, vad_identifier) -> None:
+    """Merged gaps do not count toward the minimum, and the exact boundary qualifies."""
+    write_triple(tmp_path, channels=1, sample_count=64000)
+    args = ["--input_dir", str(tmp_path), "--metrics", metric]
+    core_runtime.vad_intervals[vad_identifier] = (Interval(0, 24000), Interval(32000, 55999))
+    core_runtime.metric_parameters[metric] = {"min_active_samples": 48000}
+    assert main(args) == 0
+    (record,) = results_in(tmp_path)
+    (candidate,) = record.channels["T"].metrics[metric].interval_results
+    assert candidate.interval == Interval(0, 55999)
+    assert (candidate.status, candidate.reason) == ("ineligible", "insufficient_activity")
+    assert not core_runtime.scores and not core_runtime.dnsmos_scores
+    assert record.configuration.parameters[metric]["min_active_samples"] == 48000
+
+    core_runtime.vad_intervals[vad_identifier] = (Interval(0, 24000), Interval(32000, 56000))
+    assert main([*args, "--overwrite"]) == 0
+    (record,) = results_in(tmp_path)
+    (candidate,) = record.channels["T"].metrics[metric].interval_results
+    assert candidate.interval == Interval(0, 56000)
+    assert candidate.status == "scored"
+    scored_waveform = core_runtime.scores[0][1] if metric == "visqol" else core_runtime.dnsmos_scores[0]
+    assert scored_waveform.size == 56000
+
+    core_runtime.metric_parameters[metric]["min_active_samples"] = 48001
+    assert main(args) == 0
+    records = results_in(tmp_path)
+    assert len({result.evaluation_id for result in records}) == 2
+    stricter = next(result for result in records if result.evaluation_id != record.evaluation_id)
+    (candidate,) = stricter.channels["T"].metrics[metric].interval_results
+    assert (candidate.status, candidate.reason) == ("ineligible", "insufficient_activity")
+
+
 @pytest.mark.parametrize(
     "selection", [[], ["--metrics", "all"], ["--metrics", "speaker_cosine"], ["--metrics", "core", "wer"]]
 )
@@ -435,6 +485,24 @@ def test_short_recording_preserves_ineligible_overlap_candidate(tmp_path, core_r
     assert candidate.status == "ineligible"
     assert candidate.reason == "overlap_span_too_short"
     assert not core_runtime.scores
+
+
+@pytest.mark.parametrize("active_samples", [3199, 3200])
+def test_sisdr_overlap_activity_boundary(tmp_path, core_runtime, active_samples) -> None:
+    """Keep the ordinary utterance minimum and score overlap from 0.2 seconds."""
+    write_triple(tmp_path)
+    core_runtime.vad_intervals[2] = (Interval(0, active_samples),)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "si_sdri", "overlap_si_sdri"]) == 0
+    (record,) = results_in(tmp_path)
+    residual = record.channels["R"]
+    assert not residual.metrics["si_sdri"].interval_results
+    overlap = residual.metrics["overlap_si_sdri"]
+    if active_samples == 3200:
+        (score,) = overlap.interval_results
+        assert score.interval == Interval(0, 8000)
+        assert score.status == "scored"
+    else:
+        assert not overlap.interval_results
 
 
 def test_silent_outputs_keep_missing_utterance_diagnostics(tmp_path, core_runtime) -> None:

@@ -116,9 +116,10 @@ Select PESQ with `--metrics pesq` or add it to the core metrics with
 
 Select ViSQOL with `--metrics visqol` or add it to a subset with
 `--metrics core visqol`. Evaluation loads the speech lattice model bundled with
-the official Python binding and works offline after installation. ViSQOL scores
-reference utterance spans of at least two seconds. It takes up to the first nine
-seconds and adds half a second of silence to each end of both signals.
+the official Python binding and works offline after installation. ViSQOL requires
+at least three seconds of detected speech per reference utterance. It takes up to
+the first nine seconds of the span and adds half a second of silence to each end
+of both signals.
 
 Build the binding separately from the `eval` extra. The commands below were
 tested on Linux x86-64 with Python 3.12, GCC 13, and Bazel 5.3.2. Install that
@@ -152,7 +153,8 @@ The source revision, model checksum, and native test details are in the
 
 Select DNSMOS-P.808 with `--metrics dnsmos_p808` or add it to the core metrics
 with `--metrics core dnsmos_p808`. The `eval` extra includes the CPU runtime.
-Evaluation scores each separated utterance using two local ONNX models.
+Evaluation scores separated utterances with at least three seconds of detected
+speech using two local ONNX models.
 
 Run this setup once with network access. For offline deployment, copy the two
 verified files to `~/.torchmetrics/DNSMOS/DNSMOS/` for the account running

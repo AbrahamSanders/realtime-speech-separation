@@ -1,4 +1,8 @@
-"""Lazy CPU metric adapters for validated, aligned interval waveforms."""
+"""Lazy CPU metric adapters for the evaluation pipeline.
+
+Adapters expose scoring settings in `parameters`. The optional
+`min_active_samples` sets the pipeline's minimum detected speech in a region.
+"""
 
 import warnings
 from collections.abc import Callable
@@ -13,10 +17,9 @@ from numpy.typing import NDArray
 from .audio import EVALUATION_SAMPLE_RATE
 from .reporting import content_digest
 from .types import IntervalResultStatus
+from .vad import OVERLAP_MIN_ACTIVE_SAMPLES
 
-VISQOL_MIN_SPAN_SAMPLES = 2 * EVALUATION_SAMPLE_RATE
-VISQOL_MAX_SPAN_SAMPLES = 9 * EVALUATION_SAMPLE_RATE
-VISQOL_EDGE_PADDING_SAMPLES = EVALUATION_SAMPLE_RATE // 2
+MODEL_QUALITY_MIN_ACTIVE_SAMPLES = 3 * EVALUATION_SAMPLE_RATE
 
 
 @dataclass(frozen=True)
@@ -67,11 +70,13 @@ class SiSdr:
         self._torch = torch
         self._call = call
         self.versions = {"torch": str(torch.__version__), "torchmetrics": version("torchmetrics")}
+        dtype = "float32"
         self.parameters = {
             "zero_mean": True,
-            "dtype": "float32",
+            "dtype": dtype,
             "device": "cpu",
-            "epsilon": float(np.finfo(np.float32).eps),
+            "min_active_samples": OVERLAP_MIN_ACTIVE_SAMPLES,
+            "epsilon": float(np.finfo(dtype).eps),
             "epsilon_placement": "projection_numerator_denominator_and_both_energy_sums",
             "centered_zero_energy": "exact_float64_centering_without_positive_cutoff",
         }
@@ -82,12 +87,13 @@ class SiSdr:
             return MetricScore("ineligible", reason="zero_energy_reference")
         if centered_zero_energy(estimate):
             return MetricScore("undefined", reason="zero_energy_estimate")
-        contiguous_reference = np.ascontiguousarray(reference)
-        contiguous_estimate = np.ascontiguousarray(estimate)
-        target = self._torch.from_numpy(contiguous_reference)
-        prediction = self._torch.from_numpy(contiguous_estimate)
+        contiguous_reference = np.ascontiguousarray(reference, dtype=self.parameters["dtype"])
+        contiguous_estimate = np.ascontiguousarray(estimate, dtype=self.parameters["dtype"])
+        device = self.parameters["device"]
+        target = self._torch.as_tensor(contiguous_reference, device=device)
+        prediction = self._torch.as_tensor(contiguous_estimate, device=device)
         try:
-            score = self._call(prediction, target, zero_mean=True)
+            score = self._call(prediction, target, zero_mean=self.parameters["zero_mean"])
         except RuntimeError as exc:
             return MetricScore("failed", reason=f"si_sdr_backend_error: {exc}")
         return finite_score(score)
@@ -116,7 +122,9 @@ class Stoi:
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("error", message="Not enough STFT frames.*", category=RuntimeWarning)
-                score = self._call(reference, estimate, EVALUATION_SAMPLE_RATE, extended=False)
+                score = self._call(
+                    reference, estimate, self.parameters["sample_rate"], extended=self.parameters["extended"]
+                )
         except RuntimeWarning as exc:
             if str(exc).startswith("Not enough STFT frames"):
                 return MetricScore("ineligible", reason="insufficient_stoi_frames")
@@ -137,14 +145,15 @@ class Pesq:
 
         self._backend = pesq
         self.versions = {"pesq": version("pesq")}
-        self.parameters = {"sample_rate": EVALUATION_SAMPLE_RATE, "mode": "wb", "on_error": "raise_exception"}
+        self.parameters = {"sample_rate": EVALUATION_SAMPLE_RATE, "mode": "wb", "on_error": "RAISE_EXCEPTION"}
 
     def __call__(self, reference: NDArray[np.float32], estimate: NDArray[np.float32]) -> MetricScore:
         """Score a reference utterance using the wrapper's typed error mode."""
         backend = self._backend
+        error_mode = getattr(backend.PesqError, self.parameters["on_error"])
         try:
             score = backend.pesq(
-                EVALUATION_SAMPLE_RATE, reference, estimate, mode="wb", on_error=backend.PesqError.RAISE_EXCEPTION
+                self.parameters["sample_rate"], reference, estimate, mode=self.parameters["mode"], on_error=error_mode
             )
         except backend.BufferTooShortError:
             return MetricScore("ineligible", reason="pesq_buffer_too_short")
@@ -163,9 +172,9 @@ class Pesq:
 class Visqol:
     """Official ViSQOL speech-mode MOS-LQO for aligned mono float32 slices.
 
-    Spans under two seconds are ineligible. Eligible inputs use up to nine
-    seconds of the utterance and half a second of silence at each edge. Native
-    scoring errors and nonfinite scores are failed outcomes.
+    The pipeline requires three seconds of detected reference speech. Eligible
+    inputs use up to nine seconds of the utterance and half a second of silence
+    at each edge. Native scoring errors and nonfinite scores are failed outcomes.
     """
 
     def __init__(self) -> None:
@@ -190,16 +199,16 @@ class Visqol:
             "mode": "speech",
             "use_lattice_model": True,
             "search_window_radius": 60,
-            "min_span_samples": VISQOL_MIN_SPAN_SAMPLES,
-            "max_span_samples": VISQOL_MAX_SPAN_SAMPLES,
-            "edge_padding_samples": VISQOL_EDGE_PADDING_SAMPLES,
+            "min_active_samples": MODEL_QUALITY_MIN_ACTIVE_SAMPLES,
+            "max_span_samples": 9 * EVALUATION_SAMPLE_RATE,
+            "edge_padding_samples": EVALUATION_SAMPLE_RATE // 2,
             "dtype": "float64",
             "extension_sha256": content_digest(extension),
         }
         config = visqol_config_pb2.VisqolConfig()
-        config.audio.sample_rate = EVALUATION_SAMPLE_RATE
-        config.options.use_speech_scoring = True
-        config.options.use_lattice_model = True
+        config.audio.sample_rate = self.parameters["sample_rate"]
+        config.options.use_speech_scoring = self.parameters["mode"] == "speech"
+        config.options.use_lattice_model = self.parameters["use_lattice_model"]
         config.options.svr_model_path = str(model_path)
         config.options.search_window_radius = self.parameters["search_window_radius"]
         self._api = visqol_lib_py.VisqolApi()
@@ -214,13 +223,16 @@ class Visqol:
 
     def __call__(self, reference: NDArray[np.float32], estimate: NDArray[np.float32]) -> MetricScore:
         """Score the same padded utterance prefix in both signals, reference first."""
-        if reference.size < VISQOL_MIN_SPAN_SAMPLES:
+        if min(reference.size, estimate.size) < self.parameters["min_active_samples"]:
             return MetricScore("ineligible", reason="visqol_buffer_too_short")
         # Trim both signals at the same sample and put identical silence around them.
-        reference_prefix = np.ascontiguousarray(reference[:VISQOL_MAX_SPAN_SAMPLES], dtype=np.float64)
-        estimate_prefix = np.ascontiguousarray(estimate[:VISQOL_MAX_SPAN_SAMPLES], dtype=np.float64)
-        padded_reference = np.pad(reference_prefix, VISQOL_EDGE_PADDING_SAMPLES)
-        padded_estimate = np.pad(estimate_prefix, VISQOL_EDGE_PADDING_SAMPLES)
+        span = self.parameters["max_span_samples"]
+        padding = self.parameters["edge_padding_samples"]
+        dtype = self.parameters["dtype"]
+        reference_prefix = np.ascontiguousarray(reference[:span], dtype=dtype)
+        estimate_prefix = np.ascontiguousarray(estimate[:span], dtype=dtype)
+        padded_reference = np.pad(reference_prefix, padding)
+        padded_estimate = np.pad(estimate_prefix, padding)
         try:
             result = self._api.Measure(padded_reference, padded_estimate)
         except (self._status_error, RuntimeError, IndexError) as exc:
@@ -231,8 +243,9 @@ class Visqol:
 class DnsmosP808:
     """TorchMetrics DNSMOS-P.808 for nonempty mono float32 separated utterances.
 
-    TorchMetrics extends short inputs and averages their internal window scores.
-    Native scoring failures and nonfinite P.808 scores are failed outcomes.
+    The pipeline requires three seconds of detected separated speech. TorchMetrics
+    extends short inputs and averages their internal window scores. Native
+    scoring failures and nonfinite P.808 scores are failed outcomes.
     """
 
     def __init__(self) -> None:
@@ -249,10 +262,16 @@ class DnsmosP808:
             "sample_rate": EVALUATION_SAMPLE_RATE,
             "device": "cpu",
             "personalized": False,
+            "cache_session": True,
             "component": "p808_mos",
             "window_seconds": dnsmos.INPUT_LENGTH,
+            "min_active_samples": MODEL_QUALITY_MIN_ACTIVE_SAMPLES,
         }
-        model_paths = tuple(f"{dnsmos.DNSMOS_DIR}/DNSMOS/{name}" for name in ("model_v8.onnx", "sig_bak_ovr.onnx"))
+        companion = "pDNSMOS" if self.parameters["personalized"] else "DNSMOS"
+        model_paths = (
+            f"{dnsmos.DNSMOS_DIR}/DNSMOS/model_v8.onnx",
+            f"{dnsmos.DNSMOS_DIR}/{companion}/sig_bak_ovr.onnx",
+        )
         try:
             self.model_digests = {
                 f"dnsmos/{Path(path).name}": content_digest(Path(path).expanduser()) for path in model_paths
@@ -264,7 +283,7 @@ class DnsmosP808:
         # Refresh it for repeated invocations so a replacement model matches its digest.
         load_session = dnsmos._cached_load_session
         load_session.cache_clear()
-        device = torch.device("cpu")
+        device = torch.device(self.parameters["device"])
         try:
             for path in model_paths:
                 load_session(path, device, None)
@@ -273,14 +292,20 @@ class DnsmosP808:
 
     def __call__(self, estimate: NDArray[np.float32]) -> MetricScore:
         """Score a complete separated utterance at 16 kHz and retain P.808 MOS."""
-        if not estimate.size:
-            raise ValueError("DNSMOS requires a nonempty utterance")
+        if estimate.size < self.parameters["min_active_samples"]:
+            return MetricScore("ineligible", reason="dnsmos_buffer_too_short")
         contiguous_estimate = np.ascontiguousarray(estimate)
         prediction = self._torch.from_numpy(contiguous_estimate)
         try:
             scores = self._call(
-                prediction, EVALUATION_SAMPLE_RATE, personalized=False, device="cpu", cache_session=True
+                prediction,
+                self.parameters["sample_rate"],
+                personalized=self.parameters["personalized"],
+                device=self.parameters["device"],
+                cache_session=self.parameters["cache_session"],
             )
         except self._scoring_errors as exc:
             return MetricScore("failed", reason=f"dnsmos_backend_error: {exc}")
-        return finite_score(scores[0])
+        components = ("p808_mos", "mos_sig", "mos_bak", "mos_ovr")
+        component_index = components.index(self.parameters["component"])
+        return finite_score(scores[component_index])

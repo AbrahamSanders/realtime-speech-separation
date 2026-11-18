@@ -702,7 +702,7 @@ opt-in smoke test to establish native short-utterance behavior.
   defaults. No runtime download is needed. The evaluation ID includes the
   binding and Protobuf versions, the extension SHA-256, the speech model
   SHA-256, and the resolved scoring settings.
-- The evaluation rule uses utterance span duration. Spans under two
+- At Stage 6 the evaluation rule used utterance span duration. Spans under two
   seconds are `ineligible/visqol_buffer_too_short`. The first nine seconds at
   most are scored with 0.5 seconds of zero padding at each end of both signals.
   The padding and span limits are derived from the sample rate and included in
@@ -800,6 +800,30 @@ The cache was provisioned for the local evaluation account. A CLI smoke test
 on temporary copies of two public test-speech triples verified a scored
 separated utterance, a recording with no eligible separated utterances,
 JSON and CSV reporting, and reuse of both results.
+
+#### Follow-up on metric activity and settings
+
+The pipeline reads each interval adapter's optional `min_active_samples`
+setting and resolves missing values to the VAD utterance default. ViSQOL
+requires three seconds of reference activity, and DNSMOS requires three
+seconds of separated activity. The check uses original VAD activity, excluding
+merged gaps and padding. Under-threshold candidates retain their bounds and are
+reported as `ineligible/insufficient_activity`. The shared SI-SDRi adapter
+uses the 0.2-second overlap minimum. Ordinary SI-SDRi candidates still come
+from utterance extraction, which requires 0.5 seconds of activity. Eligible
+overlaps are padded to a half-second span when needed. An overlap candidate
+retains the span-specific reason when the recording cannot provide that span.
+
+The evaluation ID includes the resolved minimum for each selected interval
+adapter. The adapters use their recorded parameters to configure and invoke
+their backends. ViSQOL and DNSMOS also reject direct calls with waveform spans
+too short to contain the required activity. See the [evaluation protocol](../evaluation-protocol.md).
+
+Ruff lint and formatting, `git diff --check`, and the full pytest suite passed
+(224 passed, four opt-in tests skipped). All four opt-in CPU tests passed
+separately using the existing ViSQOL build and compatible Protobuf runtime.
+A CLI smoke test verified that both metrics reported a shorter utterance as
+ineligible and scored a longer utterance from temporary test-speech triples.
 
 ### Stage 8 — Add WeSpeaker similarity
 

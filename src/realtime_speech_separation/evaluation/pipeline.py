@@ -110,6 +110,11 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
         versions.update(dnsmos.versions)
         model_digests.update(dnsmos.model_digests)
         metric_parameters["dnsmos_p808"] = dnsmos.parameters
+    # Persist the resolved threshold used for each selected interval adapter.
+    metric_parameters = {
+        name: {"min_active_samples": UTTERANCE_MIN_ACTIVE_SAMPLES, **parameters}
+        for name, parameters in metric_parameters.items()
+    }
     configuration = EvaluationConfig(
         metrics=metrics,
         parameters={
@@ -156,20 +161,6 @@ def _interval_result(
     return IntervalMetricResult(
         interval, source, status, reason=reason, input_score=input_score, output_score=output_score
     )
-
-
-def _score_dnsmos(samples: NDArray[np.float32], prepared: ChannelResult, adapter: DnsmosP808) -> MetricResult:
-    """Score prepared separated-utterance spans without reference audio or timing."""
-    if prepared.separated_vad_error is not None:
-        return MetricResult("failed", reason="separated_vad_error")
-    candidates = []
-    for region in prepared.separated_utterances:
-        interval = region.interval
-        estimate = samples[interval.start : interval.end]
-        score = adapter(estimate)
-        candidate = _interval_result(interval, "separated_utterance", score)
-        candidates.append(candidate)
-    return MetricResult("enabled", tuple(candidates))
 
 
 class EvaluationPipeline:
@@ -306,23 +297,24 @@ class EvaluationPipeline:
             if prepared.status == "unavailable":
                 metrics[name] = MetricResult("unavailable", reason="missing_output_channel")
                 continue
-            # DNSMOS candidates depend only on separated-channel VAD.
+            # Obtain the candidate regions and preserve failures of their VAD sources.
             if name == "dnsmos_p808":
-                assert self.dnsmos is not None
-                samples = audio.separated.samples[index]
-                metrics[name] = _score_dnsmos(samples, prepared, self.dnsmos)
-                continue
-            # Select reference populations independently for overall and overlap scoring.
-            # Unknown populations are failures, distinct from successful VAD with no speech.
-            if name == "overlap_si_sdri" and reference_overlap is None:
-                metrics[name] = MetricResult("failed", reason="reference_overlap_vad_error")
-                continue
-            if name != "overlap_si_sdri" and prepared.reference_vad_error is not None:
-                metrics[name] = MetricResult("failed", reason="reference_vad_error")
-                continue
-            family = METRIC_FAMILIES[name]
-            regions = reference_overlap if name == "overlap_si_sdri" else prepared.reference_utterances
-            source = "reference_overlap" if name == "overlap_si_sdri" else "reference_utterance"
+                if prepared.separated_vad_error is not None:
+                    metrics[name] = MetricResult("failed", reason="separated_vad_error")
+                    continue
+                regions, source = prepared.separated_utterances, "separated_utterance"
+            elif name == "overlap_si_sdri":
+                if reference_overlap is None:
+                    metrics[name] = MetricResult("failed", reason="reference_overlap_vad_error")
+                    continue
+                regions, source = reference_overlap, "reference_overlap"
+            else:
+                if prepared.reference_vad_error is not None:
+                    metrics[name] = MetricResult("failed", reason="reference_vad_error")
+                    continue
+                regions, source = prepared.reference_utterances, "reference_utterance"
+            family = METRIC_FAMILIES.get(name, name)
+            min_active_samples = self.configuration.parameters[family]["min_active_samples"]
             candidates = []
             for region in regions:
                 interval = region.interval
@@ -330,6 +322,17 @@ class EvaluationPipeline:
                     candidates.append(
                         IntervalMetricResult(interval, source, "ineligible", reason="overlap_span_too_short")
                     )
+                    continue
+                if region.active_samples < min_active_samples:
+                    candidates.append(
+                        IntervalMetricResult(interval, source, "ineligible", reason="insufficient_activity")
+                    )
+                    continue
+                if name == "dnsmos_p808":
+                    assert self.dnsmos is not None
+                    output_samples = audio.separated.samples[index, interval.start : interval.end]
+                    score = self.dnsmos(output_samples)
+                    candidates.append(_interval_result(interval, source, score))
                     continue
                 key = (family, channel, interval)
                 reference_samples = audio.reference.samples[index, interval.start : interval.end]

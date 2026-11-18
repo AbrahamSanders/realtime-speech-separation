@@ -19,7 +19,15 @@ from realtime_speech_separation.evaluation.types import Interval
 @pytest.fixture
 def fake_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep ordinary adapter tests free of optional runtime imports."""
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(__version__="test", from_numpy=np.asarray))
+
+    def as_tensor(samples, *, device):
+        """Mimic CPU tensor conversion without importing PyTorch."""
+        assert device == "cpu"
+        return np.asarray(samples)
+
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(__version__="test", from_numpy=np.asarray, as_tensor=as_tensor)
+    )
     monkeypatch.setattr(metrics, "version", lambda name: "test")
 
 
@@ -37,7 +45,11 @@ def test_si_sdr_argument_order_dtype_and_zero_mean(fake_runtime: None) -> None:
     assert prediction.dtype == target.dtype == np.float32
     assert prediction.flags.c_contiguous
     assert call.call_args.kwargs == {"zero_mean": True}
+    assert adapter.parameters["min_active_samples"] == 3200
     assert adapter.parameters["epsilon"] == 2**-23
+    adapter.parameters["zero_mean"] = False
+    adapter(reference, estimate)
+    assert call.call_args.kwargs == {"zero_mean": False}
 
 
 @pytest.mark.parametrize("constant", [0, 0.1, -2])
@@ -77,6 +89,10 @@ def test_stoi_reference_first_valid_zero_and_warning(fake_runtime: None) -> None
     args = call.call_args.args
     assert args[0] is reference and args[1] is estimate and args[2] == 16000
     assert call.call_args.kwargs == {"extended": False}
+    adapter.parameters.update(sample_rate=8000, extended=True)
+    adapter(reference, estimate)
+    assert call.call_args.args[2] == 8000
+    assert call.call_args.kwargs == {"extended": True}
 
     def insufficient(*args, **kwargs):
         """Mimic pystoi's documented warning and numerical sentinel."""
@@ -142,8 +158,12 @@ def test_pesq_wideband_arguments_and_provenance(fake_pesq: SimpleNamespace) -> N
     sample_rate, ref_arg, est_arg = call.call_args.args
     assert sample_rate == 16000 and ref_arg is reference and est_arg is estimate
     assert call.call_args.kwargs == {"mode": "wb", "on_error": fake_pesq.PesqError.RAISE_EXCEPTION}
-    assert adapter.parameters == {"sample_rate": 16000, "mode": "wb", "on_error": "raise_exception"}
+    assert adapter.parameters == {"sample_rate": 16000, "mode": "wb", "on_error": "RAISE_EXCEPTION"}
     assert adapter.versions == {"pesq": "test"}
+    adapter.parameters.update(sample_rate=8000, mode="nb")
+    adapter(reference, estimate)
+    assert call.call_args.args[0] == 8000
+    assert call.call_args.kwargs["mode"] == "nb"
 
 
 @pytest.mark.parametrize(
@@ -213,19 +233,20 @@ def test_visqol_speech_configuration(fake_visqol: SimpleNamespace) -> None:
     assert adapter.model_digest == sha256(fake_visqol.model_path.read_bytes()).hexdigest()
     assert adapter.parameters["extension_sha256"] == sha256(fake_visqol.extension.read_bytes()).hexdigest()
     assert adapter.versions == {"visqol": "test", "protobuf": "test"}
-    assert adapter.parameters["min_span_samples"] == 32000
+    assert adapter.parameters["min_active_samples"] == 48000
     assert adapter.parameters["max_span_samples"] == 144000
     assert adapter.parameters["edge_padding_samples"] == 8000
 
 
-@pytest.mark.parametrize(("size", "scored_samples"), [(32000, 32000), (144000, 144000), (160000, 144000)])
+@pytest.mark.parametrize(("size", "scored_samples"), [(48000, 48000), (144000, 144000), (160000, 144000)])
 def test_visqol_trims_and_pads_aligned_inputs(fake_visqol: SimpleNamespace, size: int, scored_samples: int) -> None:
     """Score the same prefix in both signals and add exactly half a second at each edge."""
     adapter = metrics.Visqol()
     reference = np.linspace(-1, 1, size, dtype=np.float32)
     estimate = reference[::-1]
     short = metrics.MetricScore("ineligible", reason="visqol_buffer_too_short")
-    assert adapter(reference[:31999], estimate[:31999]) == short
+    assert adapter(reference[:47999], estimate) == short
+    assert adapter(reference, estimate[:47999]) == short
     fake_visqol.api.Measure.assert_not_called()
     assert adapter(reference, estimate) == metrics.MetricScore("scored", 3.5)
     ref_arg, est_arg = fake_visqol.api.Measure.call_args.args
@@ -246,7 +267,7 @@ def test_visqol_native_failures_and_nonfinite_scores(fake_visqol: SimpleNamespac
         metrics.Visqol()
     fake_visqol.api.Create.side_effect = None
     adapter = metrics.Visqol()
-    samples = np.ones(32000, dtype=np.float32)
+    samples = np.ones(48000, dtype=np.float32)
     fake_visqol.api.Measure.return_value = SimpleNamespace(moslqo=np.nan)
     assert adapter(samples, samples) == metrics.MetricScore("failed", reason="nonfinite_score")
     for error in (
@@ -307,9 +328,12 @@ def test_dnsmos_selects_p808_and_passes_complete_utterance(fake_dnsmos: SimpleNa
         f"dnsmos/{name}": sha256(name.encode()).hexdigest() for name in ("model_v8.onnx", "sig_bak_ovr.onnx")
     }
     assert adapter.versions == {"torchmetrics": "test", "onnxruntime": "test", "requests": "test"}
+    assert adapter.parameters["min_active_samples"] == 48000
     call = backend.deep_noise_suppression_mean_opinion_score
+    short = np.ones(47999, dtype=np.float32)
+    assert adapter(short) == metrics.MetricScore("ineligible", reason="dnsmos_buffer_too_short")
     call.assert_not_called()
-    for size in (3200, 208000):
+    for size in (48000, 208000):
         samples = np.arange(size, dtype=np.float32)[::-1]
         assert adapter(samples) == metrics.MetricScore("scored", 3.5)
         prediction, rate = call.call_args.args
@@ -337,7 +361,7 @@ def test_dnsmos_preflights_both_assets_before_loading(fake_dnsmos: SimpleNamespa
 def test_dnsmos_native_failures_and_nonfinite_p808(fake_dnsmos: SimpleNamespace) -> None:
     """Keep backend failures local and leave programming errors visible."""
     adapter = metrics.DnsmosP808()
-    samples = np.ones(3200, dtype=np.float32)
+    samples = np.ones(48000, dtype=np.float32)
     call = fake_dnsmos.backend.deep_noise_suppression_mean_opinion_score
     call.return_value = np.array([np.nan, 3, 2, 1])
     assert adapter(samples) == metrics.MetricScore("failed", reason="nonfinite_score")
@@ -418,9 +442,9 @@ def test_real_visqol_speech_minimum_and_mos_lqo() -> None:
             adapter._api.Measure(native_samples, native_samples)
     native_boundary = signal[:10240].astype(np.float64)
     assert 4.0 <= adapter._api.Measure(native_boundary, native_boundary).moslqo <= 5.0
-    too_short = signal[:31999]
+    too_short = signal[:47999]
     assert adapter(too_short, too_short) == metrics.MetricScore("ineligible", reason="visqol_buffer_too_short")
-    for size in (32000, 144000, 160000):
+    for size in (48000, 144000, 160000):
         samples = signal[:size]
         score = adapter(samples, samples)
         assert score.status == "scored"
@@ -442,7 +466,7 @@ def test_real_dnsmos_scores_short_and_long_utterances(monkeypatch: pytest.Monkey
     envelope = np.maximum(np.sin(2 * np.pi * 3 * time), 0)
     signal = (0.4 * envelope * np.sin(2 * np.pi * 190 * time)).astype(np.float32)
     adapter = metrics.DnsmosP808()
-    for size in (3200, 208000):
+    for size in (48000, 208000):
         score = adapter(signal[:size])
         assert score.status == "scored"
         assert 1.0 <= score.value <= 5.0
