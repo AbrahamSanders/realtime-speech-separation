@@ -261,6 +261,93 @@ def test_visqol_native_failures_and_nonfinite_scores(fake_visqol: SimpleNamespac
         adapter(samples, samples)
 
 
+@pytest.fixture
+def fake_dnsmos(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_runtime: None) -> SimpleNamespace:
+    """Provide local model files and fake the optional TorchMetrics and ONNX APIs."""
+    model_dir = tmp_path / "DNSMOS"
+    model_dir.mkdir()
+    for name in ("model_v8.onnx", "sig_bak_ovr.onnx"):
+        (model_dir / name).write_bytes(name.encode())
+    native = SimpleNamespace(
+        **{
+            name: type(name, (Exception,), {})
+            for name in (
+                "Fail",
+                "InvalidArgument",
+                "RuntimeException",
+                "EPFail",
+                "InvalidProtobuf",
+                "InvalidGraph",
+                "NoModel",
+                "NoSuchFile",
+            )
+        }
+    )
+    backend = SimpleNamespace(
+        DNSMOS_DIR=str(tmp_path),
+        INPUT_LENGTH=9.01,
+        deep_noise_suppression_mean_opinion_score=Mock(return_value=np.array([3.5, 1, 2, np.nan])),
+        _cached_load_session=Mock(),
+    )
+    monkeypatch.setattr(sys.modules["torch"], "device", str, raising=False)
+    monkeypatch.setitem(sys.modules, "onnxruntime.capi", SimpleNamespace(onnxruntime_pybind11_state=native))
+    monkeypatch.setitem(sys.modules, "torchmetrics.functional.audio", SimpleNamespace(dnsmos=backend))
+    return SimpleNamespace(model_dir=model_dir, native=native, backend=backend)
+
+
+def test_dnsmos_selects_p808_and_passes_complete_utterance(fake_dnsmos: SimpleNamespace) -> None:
+    """Select the first component and preserve the original waveform for TorchMetrics."""
+    adapter = metrics.DnsmosP808()
+    backend = fake_dnsmos.backend
+    backend._cached_load_session.cache_clear.assert_called_once_with()
+    assert [call.args for call in backend._cached_load_session.call_args_list] == [
+        (str(fake_dnsmos.model_dir / name), "cpu", None) for name in ("model_v8.onnx", "sig_bak_ovr.onnx")
+    ]
+    assert adapter.model_digests == {
+        f"dnsmos/{name}": sha256(name.encode()).hexdigest() for name in ("model_v8.onnx", "sig_bak_ovr.onnx")
+    }
+    assert adapter.versions == {"torchmetrics": "test", "onnxruntime": "test", "requests": "test"}
+    call = backend.deep_noise_suppression_mean_opinion_score
+    call.assert_not_called()
+    for size in (3200, 208000):
+        samples = np.arange(size, dtype=np.float32)[::-1]
+        assert adapter(samples) == metrics.MetricScore("scored", 3.5)
+        prediction, rate = call.call_args.args
+        assert rate == 16000
+        assert prediction.dtype == np.float32
+        assert prediction.flags.c_contiguous
+        np.testing.assert_array_equal(prediction, samples)
+        assert call.call_args.kwargs == {"personalized": False, "device": "cpu", "cache_session": True}
+
+
+def test_dnsmos_preflights_both_assets_before_loading(fake_dnsmos: SimpleNamespace) -> None:
+    """A missing companion fails before TorchMetrics can start a download."""
+    companion = fake_dnsmos.model_dir / "sig_bak_ovr.onnx"
+    companion.unlink()
+    with pytest.raises(RuntimeError, match="DNSMOS requires both local ONNX models.*sig_bak_ovr.onnx"):
+        metrics.DnsmosP808()
+    load_session = fake_dnsmos.backend._cached_load_session
+    load_session.assert_not_called()
+    companion.write_bytes(b"invalid")
+    load_session.side_effect = fake_dnsmos.native.InvalidProtobuf("invalid model")
+    with pytest.raises(RuntimeError, match="DNSMOS could not load its models.*invalid model"):
+        metrics.DnsmosP808()
+
+
+def test_dnsmos_native_failures_and_nonfinite_p808(fake_dnsmos: SimpleNamespace) -> None:
+    """Keep backend failures local and leave programming errors visible."""
+    adapter = metrics.DnsmosP808()
+    samples = np.ones(3200, dtype=np.float32)
+    call = fake_dnsmos.backend.deep_noise_suppression_mean_opinion_score
+    call.return_value = np.array([np.nan, 3, 2, 1])
+    assert adapter(samples) == metrics.MetricScore("failed", reason="nonfinite_score")
+    call.side_effect = fake_dnsmos.native.Fail("scoring failed")
+    assert adapter(samples) == metrics.MetricScore("failed", reason="dnsmos_backend_error: scoring failed")
+    call.side_effect = TypeError("unexpected bug")
+    with pytest.raises(TypeError, match="unexpected bug"):
+        adapter(samples)
+
+
 @pytest.mark.parametrize(
     ("baseline", "status", "input_score"),
     [
@@ -338,3 +425,27 @@ def test_real_visqol_speech_minimum_and_mos_lqo() -> None:
         score = adapter(samples, samples)
         assert score.status == "scored"
         assert 4.0 <= score.value <= 5.0
+
+
+@pytest.mark.metric_backend
+@pytest.mark.skipif(os.environ.get("RTSS_TEST_DNSMOS") != "1", reason="opt-in DNSMOS with provisioned ONNX assets")
+def test_real_dnsmos_scores_short_and_long_utterances(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use both cached CPU models and exercise repetition and multiple windows offline."""
+    from torchmetrics.functional.audio import dnsmos
+
+    def unexpected_download(*args, **kwargs):
+        """Fail the smoke test if TorchMetrics tries to provision a model."""
+        pytest.fail("DNSMOS attempted a download")
+
+    monkeypatch.setattr(dnsmos, "_prepare_dnsmos", unexpected_download)
+    time = np.arange(208000) / 16000
+    envelope = np.maximum(np.sin(2 * np.pi * 3 * time), 0)
+    signal = (0.4 * envelope * np.sin(2 * np.pi * 190 * time)).astype(np.float32)
+    adapter = metrics.DnsmosP808()
+    for size in (3200, 208000):
+        score = adapter(signal[:size])
+        assert score.status == "scored"
+        assert 1.0 <= score.value <= 5.0
+    sessions = dnsmos._cached_load_session.cache_info()
+    assert sessions.misses == 2
+    assert sessions.hits == 4

@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .audio import AudioTriple, load_audio_triple
-from .metrics import MetricScore, Pesq, SiSdr, Stoi, Visqol, centered_zero_energy
+from .metrics import DnsmosP808, MetricScore, Pesq, SiSdr, Stoi, Visqol, centered_zero_energy
 from .reporting import compatible_result, content_digest, evaluation_identity, result_path, write_result
 from .types import (
     ALL_METRICS,
@@ -73,7 +73,7 @@ def _resolve_metrics(names: Sequence[str]) -> tuple[Metric, ...]:
             selected.add(name)
         else:
             raise EvaluationUnavailableError(f"Unknown metric: {name}")
-    unavailable = selected.difference(METRIC_FAMILIES, {"activity"})
+    unavailable = selected.difference(METRIC_FAMILIES, {"activity", "dnsmos_p808"})
     if unavailable:
         raise EvaluationUnavailableError(
             f"Requested metrics are not implemented: {', '.join(sorted(unavailable))}. "
@@ -94,6 +94,7 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
         factories = {"si_sdr": SiSdr, "stoi": Stoi, "pesq": Pesq, "visqol": Visqol}
         for family in sorted(families):
             adapters[family] = factories[family]()
+        dnsmos = DnsmosP808() if "dnsmos_p808" in metrics else None
         detector = SileroVad()
     except (ImportError, OSError, RuntimeError) as exc:
         raise EvaluationUnavailableError(f"Evaluation backend preflight failed: {exc}") from exc
@@ -104,6 +105,11 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
     model_digests = {"silero_vad.jit": detector.model_digest}
     if "visqol" in adapters:
         model_digests["visqol_speech.tflite"] = adapters["visqol"].model_digest
+    metric_parameters = {name: adapter.parameters for name, adapter in adapters.items()}
+    if dnsmos is not None:
+        versions.update(dnsmos.versions)
+        model_digests.update(dnsmos.model_digests)
+        metric_parameters["dnsmos_p808"] = dnsmos.parameters
     configuration = EvaluationConfig(
         metrics=metrics,
         parameters={
@@ -117,13 +123,13 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
                 "activity_frame_samples": ACTIVITY_FRAME_SAMPLES,
                 "activity_majority": "strict_actual_frame_span",
             },
-            **{name: adapter.parameters for name, adapter in adapters.items()},
+            **metric_parameters,
         },
         metric_backend_versions=versions,
         vad_backend_version=detector.backend_version,
         model_digests=model_digests,
     )
-    return EvaluationPipeline(input_dir, configuration, detector, adapters)
+    return EvaluationPipeline(input_dir, configuration, detector, adapters, dnsmos)
 
 
 def _interval_result(
@@ -152,6 +158,20 @@ def _interval_result(
     )
 
 
+def _score_dnsmos(samples: NDArray[np.float32], prepared: ChannelResult, adapter: DnsmosP808) -> MetricResult:
+    """Score prepared separated-utterance spans without reference audio or timing."""
+    if prepared.separated_vad_error is not None:
+        return MetricResult("failed", reason="separated_vad_error")
+    candidates = []
+    for region in prepared.separated_utterances:
+        interval = region.interval
+        estimate = samples[interval.start : interval.end]
+        score = adapter(estimate)
+        candidate = _interval_result(interval, "separated_utterance", score)
+        candidates.append(candidate)
+    return MetricResult("enabled", tuple(candidates))
+
+
 class EvaluationPipeline:
     """Sequential per-mixture evaluation with injectable VAD and interval adapters.
 
@@ -165,6 +185,7 @@ class EvaluationPipeline:
         configuration: EvaluationConfig,
         detector: SpeechDetector,
         adapters: dict[str, MetricCall],
+        dnsmos: DnsmosP808 | None = None,
     ) -> None:
         """Keep shared resources and resolved identity; do not load audio yet."""
         self.input_dir = input_dir
@@ -172,6 +193,7 @@ class EvaluationPipeline:
         self.evaluation_id = evaluation_identity(configuration)
         self.detector = detector
         self.adapters = adapters
+        self.dnsmos = dnsmos
 
     def _source(self, path: Path) -> AudioSource:
         """Fingerprint bytes independently of decoding, retaining missing paths."""
@@ -278,13 +300,19 @@ class EvaluationPipeline:
         """Slice identical bounds without permutation and pool no recording means."""
         metrics = dict(prepared.metrics)
         outputs = {}
-        # Select reference populations independently for overall and overlap scoring.
         for name in INTERVAL_METRICS:
             if name not in self.configuration.metrics:
                 continue
             if prepared.status == "unavailable":
                 metrics[name] = MetricResult("unavailable", reason="missing_output_channel")
                 continue
+            # DNSMOS candidates depend only on separated-channel VAD.
+            if name == "dnsmos_p808":
+                assert self.dnsmos is not None
+                samples = audio.separated.samples[index]
+                metrics[name] = _score_dnsmos(samples, prepared, self.dnsmos)
+                continue
+            # Select reference populations independently for overall and overlap scoring.
             # Unknown populations are failures, distinct from successful VAD with no speech.
             if name == "overlap_si_sdri" and reference_overlap is None:
                 metrics[name] = MetricResult("failed", reason="reference_overlap_vad_error")

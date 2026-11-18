@@ -251,6 +251,10 @@ This reporting convention is used in
 
 DNSMOS measures the perceptual quality of the separated channels using a deep neural network-based model.
 
+Report the non-personalized P.808 MOS at 16 kHz. Pass each full separated VAD
+utterance to TorchMetrics, which repeats audio shorter than its analysis window
+and averages internal window scores into one score per utterance.
+
 We measure:
 
 1. Target DNSMOS: DNSMOS score for each Separated T channel utterance.

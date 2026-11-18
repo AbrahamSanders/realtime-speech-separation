@@ -22,7 +22,15 @@ from realtime_speech_separation.evaluation.vad import VadBackendError
 def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Inject resources at their preflight boundary, exercising the rest of the CLI."""
     state = SimpleNamespace(
-        loads=Counter(), vad_calls=[], scores=[], metric_failure=False, vad_failure=None, visqol_model_digest="model-a"
+        loads=Counter(),
+        vad_calls=[],
+        scores=[],
+        metric_failure=False,
+        vad_failure=None,
+        separated_timing={},
+        visqol_model_digest="model-a",
+        dnsmos_model_digests={"dnsmos/model_v8.onnx": "p808-a", "dnsmos/sig_bak_ovr.onnx": "companion-a"},
+        dnsmos_scores=[],
     )
 
     class Detector:
@@ -46,7 +54,8 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 raise VadBackendError("test VAD failure")
             if identifier == 0:
                 return ()
-            start, end = (0, 10000) if identifier in (1, 3) else (6000, 16000)
+            default = (0, 10000) if identifier in (1, 3) else (6000, 16000)
+            start, end = state.separated_timing.get(identifier, default)
             return (Interval(min(start, max(0, len(samples) - 3200)), min(end, len(samples))),)
 
     def adapter_factory(family):
@@ -66,11 +75,26 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             score.model_digest = state.visqol_model_digest
         return score
 
+    def dnsmos_factory():
+        """Load a fake nonintrusive adapter that receives separated audio only."""
+        state.loads["dnsmos_p808"] += 1
+
+        def score(estimate):
+            """Retain the waveform actually passed to DNSMOS."""
+            state.dnsmos_scores.append(estimate.copy())
+            return MetricScore("scored", float(estimate[0]))
+
+        score.versions = {"onnxruntime": "test"}
+        score.parameters = {"test": True}
+        score.model_digests = state.dnsmos_model_digests.copy()
+        return score
+
     monkeypatch.setattr(pipeline, "SileroVad", Detector)
     monkeypatch.setattr(pipeline, "SiSdr", lambda: adapter_factory("si_sdr"))
     monkeypatch.setattr(pipeline, "Stoi", lambda: adapter_factory("stoi"))
     monkeypatch.setattr(pipeline, "Pesq", lambda: adapter_factory("pesq"))
     monkeypatch.setattr(pipeline, "Visqol", lambda: adapter_factory("visqol"))
+    monkeypatch.setattr(pipeline, "DnsmosP808", dnsmos_factory)
     return state
 
 
@@ -295,8 +319,74 @@ def test_visqol_model_digest_controls_result_reuse(tmp_path, core_runtime) -> No
     assert {record.configuration.model_digests["visqol_speech.tflite"] for record in records} == {"model-a", "model-b"}
 
 
+@pytest.mark.parametrize("channels", [1, 2])
+def test_cli_dnsmos_uses_separated_utterance_bounds(tmp_path, core_runtime, channels) -> None:
+    """Separated VAD independently determines the waveform slices and report bounds."""
+    write_triple(tmp_path, channels=channels)
+    core_runtime.separated_timing = {3: (2100, 10100), 4: (1000, 10000)}
+    assert main(["--input_dir", str(tmp_path), "--metrics", "dnsmos_p808"]) == 0
+    assert core_runtime.loads == {"vad": 1, "dnsmos_p808": 1}
+    assert not core_runtime.scores
+    (record,) = results_in(tmp_path)
+    assert record.configuration.metric_backend_versions["onnxruntime"] == "test"
+    assert record.configuration.model_digests.items() >= core_runtime.dnsmos_model_digests.items()
+    separation = tmp_path / record.sources.separated.path
+    waveform, _ = sf.read(separation, dtype="float32", always_2d=True)
+    for index, (channel, (start, end)) in enumerate(
+        zip(("T", "R"), core_runtime.separated_timing.values(), strict=True)
+    ):
+        result = record.channels[channel].metrics["dnsmos_p808"]
+        if index >= channels:
+            assert result.status == "unavailable"
+            assert result.reason == "missing_output_channel"
+            continue
+        assert result.status == "enabled"
+        (score,) = result.interval_results
+        assert score.interval == Interval(start, end)
+        assert score.interval_source == "separated_utterance"
+        assert score.value == float(waveform[start, index])
+        assert score.input_score is score.output_score is None
+        np.testing.assert_array_equal(core_runtime.dnsmos_scores[index], waveform[start:end, index])
+    assert len(core_runtime.dnsmos_scores) == channels
+    (summary_file,) = tmp_path.glob("summary_*.json")
+    summary = json.loads(summary_file.read_text())
+    assert summary["channels"]["T"]["metrics"]["dnsmos_p808"]["coverage"]["scored"] == 1
+    (csv_file,) = tmp_path.glob("metrics_*.csv")
+    with csv_file.open(newline="") as stream:
+        (row,) = csv.DictReader(stream)
+    assert float(row["T_dnsmos_p808_mean"]) == float(waveform[2100, 0])
+
+
+@pytest.mark.parametrize("failing_identifier", [1, 3])
+def test_cli_dnsmos_preserves_scores_when_one_vad_fails(tmp_path, core_runtime, failing_identifier) -> None:
+    """Reference VAD does not gate DNSMOS and separated VAD failures affect their own channel."""
+    write_triple(tmp_path)
+    core_runtime.vad_failure = failing_identifier
+    assert main(["--input_dir", str(tmp_path), "--metrics", "dnsmos_p808"]) == 1
+    (record,) = results_in(tmp_path)
+    target = record.channels["T"].metrics["dnsmos_p808"]
+    if failing_identifier == 1:
+        assert target.interval_results[0].status == "scored"
+    else:
+        assert target.status == "failed"
+        assert target.reason == "separated_vad_error"
+    assert record.channels["R"].metrics["dnsmos_p808"].interval_results[0].status == "scored"
+
+
+def test_dnsmos_companion_digest_controls_result_reuse(tmp_path, core_runtime) -> None:
+    """A changed companion model invalidates cached DNSMOS scores."""
+    write_triple(tmp_path, channels=1)
+    args = ["--input_dir", str(tmp_path), "--metrics", "dnsmos_p808"]
+    assert main(args) == main(args) == 0
+    assert len(core_runtime.dnsmos_scores) == 1
+    core_runtime.dnsmos_model_digests["dnsmos/sig_bak_ovr.onnx"] = "companion-b"
+    assert main(args) == 0
+    assert len(core_runtime.dnsmos_scores) == 2
+    assert len({record.evaluation_id for record in results_in(tmp_path)}) == 2
+
+
 @pytest.mark.parametrize(
-    "selection", [[], ["--metrics", "all"], ["--metrics", "dnsmos_p808"], ["--metrics", "core", "wer"]]
+    "selection", [[], ["--metrics", "all"], ["--metrics", "speaker_cosine"], ["--metrics", "core", "wer"]]
 )
 def test_unimplemented_selections_fail_before_preflight(tmp_path, core_runtime, selection, caplog) -> None:
     """All remains the full protocol and cannot silently fall back to core."""

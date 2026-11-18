@@ -1,6 +1,6 @@
 # Evaluation CLI implementation plan
 
-Stages 1–6 are implemented. DNSMOS, speaker, and ASR backends remain planned.
+Stages 1–7 are implemented. Speaker and ASR backends remain planned.
 
 ## Objective and scope
 
@@ -64,7 +64,7 @@ backend detects speech (Silero), the speaker backend extracts embeddings
 | WER | `jiwer.process_words`, JiWER 4+. | Retain edit counts, including insertions against empty references. [Usage](https://jitsi.github.io/jiwer/usage/). |
 | Intervals, activity, cosine, aggregation | Small NumPy/Python helpers. | Reuse libraries for signal metrics, features, neural inference, and edit distance. |
 
-Use `eval` for Silero/TorchMetrics/pystoi/PESQ and the planned DNSMOS dependencies,
+Use `eval` for Silero/TorchMetrics/pystoi/PESQ and the DNSMOS dependencies,
 `eval-speaker` for the speaker frontend, and `eval-asr` for pywhispercpp/JiWER.
 The latter extras include `eval`. Document ViSQOL native setup separately.
 Replace Asteroid when core metrics land; retain pandas only if reporting uses it.
@@ -755,6 +755,51 @@ wrote JSON and CSV, and reused both results on the second run.
 **Tests:** a fake four-component return verifies P.808 selection and separated
 utterance bounds. An opt-in DNSMOS metric-backend smoke test covers short and long utterances
 with pre-provisioned assets.
+
+**Implementation notes**
+
+- `--metrics dnsmos_p808` uses the separated VAD utterances on each available
+  channel. It sends each complete 16 kHz span to the CPU TorchMetrics function
+  and retains its first component, `p808_mos`. TorchMetrics handles short-input
+  repetition and internal window averaging. Failed separated VAD marks that
+  channel's DNSMOS measurement as failed. Reference VAD failures leave scores
+  from healthy separated channels available. A successful VAD with zero eligible
+  utterances yields zero candidates.
+- Assumption for provisioning is a stable, readable TorchMetrics model cache
+  for the evaluation account. The two files are Microsoft's `model_v8.onnx`
+  (P.808) and `sig_bak_ovr.onnx` (companion for the non-personalized call).
+  The setup pins Microsoft DNS-Challenge revision
+  `785ab12275d5cf9341c5e946b0eee9f8825ece3b` and verifies both SHA-256 hashes.
+  RTSS fingerprints both installed files before loading either session and
+  includes those digests, scoring settings, and runtime versions in the
+  evaluation ID. Preflight uses TorchMetrics' private cached session loader
+  because its public scoring API loads the sessions lazily. It refreshes the
+  cache on pipeline creation so subsequent invocations in the same process
+  can pick up replaced models. The CPU sessions are shared by all scores in
+  the run. Missing or invalid assets fail preflight with setup instructions.
+  [Cache setup and checksums](../../README.md#dnsmos-p808-setup) ·
+  [Microsoft ONNX assets](https://github.com/microsoft/DNS-Challenge/tree/785ab12275d5cf9341c5e946b0eee9f8825ece3b/DNSMOS/DNSMOS) ·
+  [TorchMetrics cache and scoring implementation](https://github.com/Lightning-AI/torchmetrics/blob/v1.8.2/src/torchmetrics/functional/audio/dnsmos.py)
+- The `eval` extra adds `onnxruntime>=1.20.1` and `requests>=2.32.5`.
+  TorchMetrics requires requests for scoring even when the ONNX assets are
+  provisioned offline. PyPI publishes Python 3.11 and 3.12 CPU wheels for ONNX
+  Runtime 1.20.1 and Python 3.14 CPU wheels for newer releases within the range.
+  [ONNX Runtime 1.20.1 files](https://pypi.org/project/onnxruntime/1.20.1/#files) ·
+  [ONNX Runtime 1.32.0 files](https://pypi.org/project/onnxruntime/1.32.0/#files)
+
+**Checks**
+
+Ruff lint and formatting, `git diff --check`, and pytest passed in the
+`audio` environment on Python 3.12.13 (222 passed, four opt-in tests skipped).
+The opt-in test passed with `RTSS_TEST_DNSMOS=1` and `-m metric_backend` using
+TorchMetrics 1.8.2 and CPU ONNX Runtime 1.20.1 and 1.32.0. It blocked the
+download path and verified that the two sessions served both a 0.2-second
+input and a 13-second input.
+
+The cache was provisioned for the local evaluation account. A CLI smoke test
+on temporary copies of two public test-speech triples verified a scored
+separated utterance, a recording with no eligible separated utterances,
+JSON and CSV reporting, and reuse of both results.
 
 ### Stage 8 — Add WeSpeaker similarity
 

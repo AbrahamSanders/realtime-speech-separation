@@ -148,6 +148,38 @@ python -m pip install --no-build-isolation .
 The source revision, model checksum, and native test details are in the
 [Stage 6 implementation notes](docs/plans/eval_cli.md#stage-6--add-visqol).
 
+#### DNSMOS-P.808 setup
+
+Select DNSMOS-P.808 with `--metrics dnsmos_p808` or add it to the core metrics
+with `--metrics core dnsmos_p808`. The `eval` extra includes the CPU runtime.
+Evaluation scores each separated utterance using two local ONNX models.
+
+Run this setup once with network access. For offline deployment, copy the two
+verified files to `~/.torchmetrics/DNSMOS/DNSMOS/` for the account running
+evaluation.
+
+```bash
+(
+    set -eu
+    dnsmos_staging=$(mktemp -d)
+    trap 'rm -r -- "$dnsmos_staging"' EXIT
+    cd "$dnsmos_staging"
+    dnsmos_source=https://raw.githubusercontent.com/microsoft/DNS-Challenge/785ab12275d5cf9341c5e946b0eee9f8825ece3b/DNSMOS/DNSMOS
+    curl --fail --location --output model_v8.onnx "$dnsmos_source/model_v8.onnx"
+    curl --fail --location --output sig_bak_ovr.onnx "$dnsmos_source/sig_bak_ovr.onnx"
+    sha256sum --check <<'EOF'
+9246480c58567bc6affd4200938e77eef49468c8bc7ed3776d109c07456f6e91  model_v8.onnx
+269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd  sig_bak_ovr.onnx
+EOF
+    dnsmos_cache=~/.torchmetrics/DNSMOS/DNSMOS
+    mkdir -p "$dnsmos_cache"
+    install -m 0644 model_v8.onnx sig_bak_ovr.onnx "$dnsmos_cache/"
+)
+```
+
+See the [Stage 7 implementation notes](docs/plans/eval_cli.md#stage-7--add-dnsmos-p808)
+for model provenance and runtime details.
+
 ### Usage Notes
 
 By default, `rtss.separate` and `rtss.eval` will skip any already processed files.

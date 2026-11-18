@@ -35,8 +35,10 @@ client = [
     "gradio>=5,<6",
 ]
 eval = [
+    "onnxruntime>=1.20.1",
     "pesq>=0.0.4",
     "pystoi>=0.4.1",
+    "requests>=2.32.5",
     "silero-vad>=6.2.1",
     "torch>=2.2",
     "torchmetrics>=1.8.2",

@@ -226,3 +226,61 @@ class Visqol:
         except (self._status_error, RuntimeError, IndexError) as exc:
             return MetricScore("failed", reason=f"visqol_backend_error: {exc}")
         return finite_score(result.moslqo)
+
+
+class DnsmosP808:
+    """TorchMetrics DNSMOS-P.808 for nonempty mono float32 separated utterances.
+
+    TorchMetrics extends short inputs and averages their internal window scores.
+    Native scoring failures and nonfinite P.808 scores are failed outcomes.
+    """
+
+    def __init__(self) -> None:
+        """Fingerprint both local assets and preload their TorchMetrics CPU sessions."""
+        import torch
+        from onnxruntime.capi import onnxruntime_pybind11_state as ort
+        from torchmetrics.functional.audio import dnsmos
+
+        self._call = dnsmos.deep_noise_suppression_mean_opinion_score
+        self._torch = torch
+        self._scoring_errors = (RuntimeError, ort.Fail, ort.InvalidArgument, ort.RuntimeException, ort.EPFail)
+        self.versions = {name: version(name) for name in ("torchmetrics", "onnxruntime", "requests")}
+        self.parameters = {
+            "sample_rate": EVALUATION_SAMPLE_RATE,
+            "device": "cpu",
+            "personalized": False,
+            "component": "p808_mos",
+            "window_seconds": dnsmos.INPUT_LENGTH,
+        }
+        model_paths = tuple(f"{dnsmos.DNSMOS_DIR}/DNSMOS/{name}" for name in ("model_v8.onnx", "sig_bak_ovr.onnx"))
+        try:
+            self.model_digests = {
+                f"dnsmos/{Path(path).name}": content_digest(Path(path).expanduser()) for path in model_paths
+            }
+        except OSError as exc:
+            raise RuntimeError(f"DNSMOS requires both local ONNX models. See the README's DNSMOS setup. {exc}") from exc
+
+        # Use the same session cache as the functional API to load each model once.
+        # Refresh it for repeated invocations so a replacement model matches its digest.
+        load_session = dnsmos._cached_load_session
+        load_session.cache_clear()
+        device = torch.device("cpu")
+        try:
+            for path in model_paths:
+                load_session(path, device, None)
+        except (*self._scoring_errors, ort.InvalidProtobuf, ort.InvalidGraph, ort.NoModel, ort.NoSuchFile) as exc:
+            raise RuntimeError(f"DNSMOS could not load its models. See the README's DNSMOS setup. {exc}") from exc
+
+    def __call__(self, estimate: NDArray[np.float32]) -> MetricScore:
+        """Score a complete separated utterance at 16 kHz and retain P.808 MOS."""
+        if not estimate.size:
+            raise ValueError("DNSMOS requires a nonempty utterance")
+        contiguous_estimate = np.ascontiguousarray(estimate)
+        prediction = self._torch.from_numpy(contiguous_estimate)
+        try:
+            scores = self._call(
+                prediction, EVALUATION_SAMPLE_RATE, personalized=False, device="cpu", cache_session=True
+            )
+        except self._scoring_errors as exc:
+            return MetricScore("failed", reason=f"dnsmos_backend_error: {exc}")
+        return finite_score(scores[0])
