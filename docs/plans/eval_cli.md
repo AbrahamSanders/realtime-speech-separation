@@ -1,6 +1,6 @@
 # Evaluation CLI implementation plan
 
-Stages 1–8 are implemented. The ASR backend remains planned.
+Stages 1–9 are implemented.
 
 ## Objective and scope
 
@@ -64,9 +64,8 @@ backend detects speech (Silero), the speaker backend extracts embeddings
 | WER | `jiwer.process_words`, JiWER 4+. | Retain edit counts, including insertions against empty references. [Usage](https://jitsi.github.io/jiwer/usage/). |
 | Intervals, activity, cosine, aggregation | Small NumPy/Python helpers. | Reuse libraries for signal metrics, features, neural inference, and edit distance. |
 
-Use `eval` for Silero, TorchMetrics, pystoi, PESQ, DNSMOS, and the speaker
-frontend. The planned `eval-asr` extra includes `eval` and adds pywhispercpp
-and JiWER. Document ViSQOL native setup separately.
+Use `eval` for Silero, TorchMetrics, pystoi, PESQ, DNSMOS, the speaker frontend,
+pywhispercpp, and JiWER. Document ViSQOL native setup separately.
 Replace Asteroid when core metrics land; retain pandas only if reporting uses it.
 Avoid broad toolkit extras and changes to unrelated dependency groups.
 
@@ -932,8 +931,8 @@ results produced under the previous span rule and wrote a new report.
 
 ### Stage 9 — Add transcription and WER
 
-- Add `asr.py` using in-process pywhispercpp and a local large-v3-turbo model;
-  add pywhispercpp/JiWER 4+ to `eval-asr`. Record decoding settings and quantization.
+- Add `asr.py` using in-process pywhispercpp and a local large-v3-turbo model.
+  Add pywhispercpp and JiWER 4+ to `eval`. Record decoding settings and quantization.
 - Transcribe full channels as specified by the protocol. Pass contiguous mono
   float32 arrays directly to `Model.transcribe` and concatenate returned segments.
 - Apply the agreed language policy and deterministic settings where available.
@@ -948,6 +947,67 @@ results produced under the previous span rule and wrote a new report.
 **Tests:** fake model outputs and known text pairs cover edit counts, empty
 references/hypotheses, Unicode/punctuation normalization, language consistency,
 and no prompt/parameter leakage. Keep real large-v3-turbo transcription opt-in.
+
+**Implementation notes**
+
+- `--metrics wer` loads one CPU pywhispercpp model. The existing `eval` extra
+  includes `pywhispercpp>=1.5.1` and `jiwer>=4`. The implementation assumes the
+  upstream F16 large-v3-turbo export at revision
+  `5359861c739e955e79d9a303bcbc70fb988958b1` for comparable scores. Preflight
+  verifies its SHA-256 before loading it. Place the file in the RTSS ASR cache
+  or supply `--asr_model_path`. Evaluation uses the local file offline.
+  [Model setup](../../README.md#whisper-setup)
+- pywhispercpp 1.5.1 returns `((language, probability), all_probabilities)` from
+  `Model.auto_detect_language`. RTSS sends the full reference waveform and
+  uses the binding's first analysis window at offset zero. A valid language
+  code and positive finite probability are required because a negative native
+  status can be interpreted as a Python list index by this binding. If set,
+  `--asr_language` accepts a Whisper language code and skips detection.
+  RTSS reuses each reference transcript, including its language, across
+  variants of the same mixture. It transcribes only channels with a paired
+  separated channel and runs ASR independently of evaluation VAD.
+  [Released binding](https://github.com/absadiki/pywhispercpp/blob/v1.5.1/pywhispercpp/model.py)
+- The adapter sends contiguous 16 kHz mono float32 waveforms to `Model.transcribe`.
+  It reapplies the full-length transcription settings on each call, including
+  greedy decoding at temperature zero with fallback disabled, no prior context,
+  empty prompts, and disabled backend VAD. Other parameters, including thread
+  counts, use the binding defaults. It joins the stripped segments returned by
+  the binding with single spaces. The evaluation ID includes the model digest,
+  quantization, recognizer and JiWER versions, decoding settings, language
+  override, normalizer identity, and Unicode data version. Per-channel JSON uses
+  the existing transcript/count schema. The CSV records edit counts per
+  separation, and the summary pools them by channel, including insertions
+  against empty references.
+- Exposed transcription and alignment errors mark the affected WER outcome as
+  failed. A failed separated transcription retains its successful reference
+  transcript. pywhispercpp 1.5.1's public transcription method discards the native
+  `whisper_full` return code, so an error visible only through that code cannot
+  be distinguished from the returned segment list. The adapter uses the public
+  method's segments and exceptions. Selecting `all` now enables every family and
+  marks the run as a full protocol evaluation.
+
+To run the opt-in CPU check, put the verified model and the upstream
+[`jfk.wav` sample](https://github.com/ggml-org/whisper.cpp/blob/v1.8.4/samples/jfk.wav)
+in an asset directory and run:
+
+```bash
+RTSS_TEST_ASR=1 RTSS_ASR_TEST_ASSETS=/path/to/asr-assets \
+    python -m pytest tests/test_evaluation_asr.py -m metric_backend
+```
+
+**Checks**
+
+Ruff lint and formatting, `git diff --check`, and pytest passed on Python
+3.12.13 in the `audio` environment. With pywhispercpp 1.5.1 and JiWER 4.0.0
+available, pytest reported 259 passed and six opt-in skips. The run in the
+existing environment also passed with the JiWER edit-count test skipped.
+The opt-in CPU test detected English on the public JFK sample and reproduced
+the same 22-word transcript with zero edits when scoring identical audio.
+
+A CPU CLI smoke test on a temporary copy of a 60-second CallFriend dev-set
+triple scored both channels and detected English for each. The edit counts
+agreed across the result JSON, summary JSON, and CSV. A rerun reused the
+result. The inputs consisted of the mixture, reference, and separated audio.
 
 ### Stage 10 — Finish reports, documentation, and integration
 

@@ -12,10 +12,11 @@ import soundfile as sf
 
 from realtime_speech_separation.eval_cli import main
 from realtime_speech_separation.evaluation import pipeline
+from realtime_speech_separation.evaluation.asr import AsrBackendError
 from realtime_speech_separation.evaluation.metrics import MetricScore
 from realtime_speech_separation.evaluation.reporting import parse_result, result_path
 from realtime_speech_separation.evaluation.speaker import MODEL_NAME, WeSpeaker
-from realtime_speech_separation.evaluation.types import Interval
+from realtime_speech_separation.evaluation.types import ALL_METRICS, Interval, Transcript, WordCounts, WordErrorResult
 from realtime_speech_separation.evaluation.vad import (
     OVERLAP_MIN_ACTIVE_SAMPLES,
     UTTERANCE_MIN_ACTIVE_SAMPLES,
@@ -470,12 +471,116 @@ def test_cli_checks_detected_activity_before_scoring(tmp_path, core_runtime, met
 
 
 @pytest.mark.parametrize("selection", [[], ["--metrics", "all"], ["--metrics", "wer"], ["--metrics", "core", "wer"]])
-def test_unimplemented_selections_fail_before_preflight(tmp_path, core_runtime, selection, caplog) -> None:
-    """All remains the full protocol and cannot silently fall back to core."""
-    assert main(["--input_dir", str(tmp_path), *selection]) == 1
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_wer_model_errors_fail_before_processing(tmp_path, core_runtime, selection, corrupt, caplog) -> None:
+    """Require the local model for WER, including when selected implicitly via all."""
+    model_path = tmp_path / "test.bin"
+    if corrupt:
+        model_path.write_bytes(b"corrupt model")
+    assert main(["--input_dir", str(tmp_path), "--asr_model_path", str(model_path), *selection]) == 1
     assert not core_runtime.loads
-    assert "not implemented" in caplog.text
-    assert not list(tmp_path.iterdir())
+    assert ("Unexpected Whisper model checksum" if corrupt else "Missing Whisper model") in caplog.text
+    assert not list(tmp_path.glob("*.json"))
+
+
+@pytest.fixture
+def wer_runtime(core_runtime, monkeypatch):
+    """Inject a deterministic full-channel adapter at the pipeline's preflight boundary."""
+    state = SimpleNamespace(references=[], separations=[], fail=0, digest="whisper-a")
+
+    class FakeWhisperWer:
+        """Make channel assignment, failures, and provenance visible to the CLI tests."""
+
+        def __init__(self, path, language):
+            """Capture the model path and language override passed to preflight."""
+            core_runtime.loads["wer"] += 1
+            state.path = path
+            self.language = language
+            self.backend_version = "test-whisper"
+            self.versions = {"jiwer": "test-jiwer"}
+            self.model_digest = state.digest
+            self.parameters = {"language_override": language}
+
+        def transcribe_reference(self, waveform):
+            """Transcribe the target as English and residual as French unless overridden."""
+            marker = round(float(waveform[0]))
+            state.references.append((marker, len(waveform)))
+            if marker == state.fail:
+                raise AsrBackendError("transcription_error: test failure")
+            return Transcript("Speech!", "speech", self.language or ("en" if marker == 1 else "fr"))
+
+        def compare(self, reference, waveform):
+            """Score the full estimate using its corresponding reference language."""
+            marker = round(float(waveform[0]))
+            state.separations.append((marker, len(waveform), reference.language))
+            if marker == state.fail:
+                return WordErrorResult("failed", reference=reference, reason="separated_transcription_error")
+            return WordErrorResult("scored", WordCounts(0, 0, 0, 1), reference, reference)
+
+    monkeypatch.setattr(pipeline, "WhisperWer", FakeWhisperWer)
+    return state
+
+
+def test_full_cli_scores_wer_independently_of_vad_and_reuses_references(
+    tmp_path, core_runtime, wer_runtime, monkeypatch
+):
+    """Default to all metrics, process complete channels, and scope reference reuse to one mixture."""
+    write_triple(tmp_path, name="stereo", variants=("a", "b"), sample_count=32001)
+    write_triple(tmp_path, name="mono", channels=1)
+    core_runtime.vad_intervals = dict.fromkeys((1, 2, 3, 4), ())
+    speaker_model = tmp_path / "speaker.onnx"
+    monkeypatch.setattr(pipeline, "cached_speaker_model", lambda: speaker_model)
+    model = tmp_path / "whisper.bin"
+    args = ["--input_dir", str(tmp_path), "--asr_model_path", str(model)]
+    assert main(args) == 0
+    assert wer_runtime.path == model
+    assert core_runtime.loads["wer"] == 1
+    assert Counter(wer_runtime.references) == {(1, 32001): 1, (2, 32001): 1, (1, 16000): 1}
+    assert Counter(wer_runtime.separations) == {(3, 32001, "en"): 2, (4, 32001, "fr"): 2, (3, 16000, "en"): 1}
+    mono, *stereo = results_in(tmp_path)
+    assert mono.channels["R"].wer.status == "unavailable"
+    for record in stereo:
+        assert set(record.configuration.metrics) == set(ALL_METRICS)
+        assert record.configuration.parameters["protocol_scope"] == "full"
+        assert record.configuration.asr_backend_version == "test-whisper"
+        assert record.configuration.metric_backend_versions["jiwer"] == "test-jiwer"
+        assert record.channels["R"].wer.reference.language == "fr"
+    summary_path = tmp_path / f"summary_a_{stereo[0].evaluation_id}_all.json"
+    summary = json.loads(summary_path.read_text())
+    assert summary["channels"]["R"]["wer"]["reference_words"] == 1
+    csv_path = tmp_path / f"metrics_a_{stereo[0].evaluation_id}_all.csv"
+    with csv_path.open(newline="") as stream:
+        (row,) = csv.DictReader(stream)
+    assert row["R_wer_wer"] == "0.0"
+
+    wer_runtime.references.clear()
+    wer_runtime.separations.clear()
+    assert main(args) == 0
+    assert not wer_runtime.references and not wer_runtime.separations
+    assert json.loads(summary_path.read_text())["recordings"]["reused"] == 1
+
+    assert main([*args, "--asr_language", "fr"]) == 0
+    assert len({record.evaluation_id for record in results_in(tmp_path)}) == 2
+    assert {language for _, _, language in wer_runtime.separations} == {"fr"}
+
+
+@pytest.mark.parametrize("failed_marker", [1, 3])
+def test_asr_failure_retains_other_scores_and_retries(tmp_path, core_runtime, wer_runtime, failed_marker):
+    """Persist failed WER and retry without discarding the healthy channel or requested activity."""
+    write_triple(tmp_path)
+    wer_runtime.fail = failed_marker
+    args = ["--input_dir", str(tmp_path), "--metrics", "activity", "wer"]
+    assert main(args) == 1
+    (record,) = results_in(tmp_path)
+    target = record.channels["T"]
+    assert target.wer.status == "failed"
+    assert (target.wer.reference is None) == (failed_marker == 1)
+    assert record.channels["R"].wer.status == "scored"
+    assert target.activity.status == "scored"
+    wer_runtime.fail = 0
+    assert main(args) == 0
+    (record,) = results_in(tmp_path)
+    assert record.channels["T"].wer.status == "scored"
 
 
 def test_speaker_prototypes_use_raw_equal_weights_and_are_scoped_to_each_recording(tmp_path, core_runtime) -> None:

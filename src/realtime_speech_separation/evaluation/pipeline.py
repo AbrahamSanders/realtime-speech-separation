@@ -7,6 +7,8 @@ from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 
+from .asr import MODEL_NAME as ASR_MODEL_NAME
+from .asr import AsrBackendError, WhisperWer
 from .audio import MIN_RECORDING_SECONDS, AudioTriple, load_audio_triple
 from .metrics import DnsmosP808, MetricScore, Pesq, SiSdr, SpeakerCosine, Stoi, Visqol, centered_zero_energy
 from .reporting import compatible_result, content_digest, evaluation_identity, result_path, write_result
@@ -29,6 +31,8 @@ from .types import (
     RecordingError,
     RecordingResult,
     SpeechRegion,
+    Transcript,
+    WordErrorResult,
 )
 from .vad import (
     ACTIVITY_FRAME_SAMPLES,
@@ -62,7 +66,7 @@ class EvaluationUnavailableError(RuntimeError):
 
 
 def _resolve_metrics(names: Sequence[str]) -> tuple[Metric, ...]:
-    """Expand all/core and reject unavailable families without silently reducing scope."""
+    """Expand all/core and reject unknown or empty selections."""
     selected = set()
     for name in names:
         if name == "all":
@@ -73,26 +77,28 @@ def _resolve_metrics(names: Sequence[str]) -> tuple[Metric, ...]:
             selected.add(name)
         else:
             raise EvaluationUnavailableError(f"Unknown metric: {name}")
-    unavailable = selected.difference(METRIC_FAMILIES, {"activity"})
-    if unavailable:
-        raise EvaluationUnavailableError(
-            f"Requested metrics are not implemented: {', '.join(sorted(unavailable))}. "
-            "Use --metrics core or individual implemented metrics for a partial protocol evaluation."
-        )
     if not selected:
         raise EvaluationUnavailableError("Select at least one metric")
     return tuple(sorted(selected))
 
 
 def create_pipeline(
-    input_dir: Path, metrics: Sequence[str], *, speaker_model_path: Path | None = None
+    input_dir: Path,
+    metrics: Sequence[str],
+    *,
+    speaker_model_path: Path | None = None,
+    asr_model_path: Path | None = None,
+    asr_language: str | None = None,
 ) -> "EvaluationPipeline":
-    """Preflight selected adapters, provisioning the default speaker model when needed."""
+    """Preflight selected adapters and their required model assets before processing."""
     metrics = _resolve_metrics(metrics)
     adapters: dict[str, IntervalAdapter] = {}
     speaker_extractor = None
+    wer_adapter = None
     # Import and initialize only requested metric families, before any output writes.
     try:
+        if "wer" in metrics:
+            wer_adapter = WhisperWer(asr_model_path, asr_language)
         if "speaker_cosine" in metrics:
             model_path = cached_speaker_model() if speaker_model_path is None else speaker_model_path.expanduser()
             speaker_extractor = WeSpeaker(model_path)
@@ -119,10 +125,14 @@ def create_pipeline(
     parameters = {name: adapter.parameters for name, adapter in adapters.items()}
     if speaker_extractor is not None:
         model_digests[MODEL_NAME] = speaker_extractor.model_digest
+    if wer_adapter is not None:
+        model_digests[ASR_MODEL_NAME] = wer_adapter.model_digest
+        versions.update(wer_adapter.versions)
+        parameters["wer"] = wer_adapter.parameters
     configuration = EvaluationConfig(
         metrics=metrics,
         parameters={
-            "protocol_scope": "partial",
+            "protocol_scope": "full" if len(metrics) == len(ALL_METRICS) else "partial",
             "vad": detector.parameters,
             "timing": {
                 "min_recording_seconds": MIN_RECORDING_SECONDS,
@@ -138,9 +148,10 @@ def create_pipeline(
         metric_backend_versions=versions,
         vad_backend_version=detector.backend_version,
         speaker_backend_version=speaker_extractor.backend_version if speaker_extractor is not None else None,
+        asr_backend_version=wer_adapter.backend_version if wer_adapter is not None else None,
         model_digests=model_digests,
     )
-    return EvaluationPipeline(input_dir, configuration, detector, adapters, speaker_extractor)
+    return EvaluationPipeline(input_dir, configuration, detector, adapters, speaker_extractor, wer_adapter)
 
 
 def _interval_result(
@@ -170,9 +181,9 @@ def _interval_result(
 
 
 class EvaluationPipeline:
-    """Sequential per-mixture evaluation with injectable VAD and interval adapters.
+    """Sequential per-mixture evaluation with injectable VAD, metric, speaker, and ASR adapters.
 
-    Each call scopes reference timing, prototypes, and baseline caches to one
+    Each call scopes reference timing, prototypes, transcripts, and baseline caches to one
     mixture. Failed results are persisted for diagnosis and recomputed later.
     """
 
@@ -183,6 +194,7 @@ class EvaluationPipeline:
         detector: SpeechDetector,
         adapters: dict[str, IntervalAdapter],
         speaker_extractor: WeSpeaker | None = None,
+        wer_adapter: WhisperWer | None = None,
     ) -> None:
         """Keep shared resources and resolved identity; do not load audio yet."""
         self.input_dir = input_dir
@@ -191,6 +203,7 @@ class EvaluationPipeline:
         self.detector = detector
         self.adapters = adapters
         self.speaker_extractor = speaker_extractor
+        self.wer_adapter = wer_adapter
 
     def _source(self, path: Path) -> AudioSource:
         """Fingerprint bytes independently of decoding, retaining missing paths."""
@@ -215,6 +228,7 @@ class EvaluationPipeline:
         reference_speech = None
         baselines = {}
         prototypes: dict[Channel, ReferencePrototype] = {}
+        transcripts: dict[Channel, Transcript | str] = {}
         for separated, inference_hash in separations:
             sources = AudioSources(mixture_source, reference_source, self._source(separated))
             destination = result_path(mixture, inference_hash, self.evaluation_id)
@@ -278,7 +292,7 @@ class EvaluationPipeline:
                             vad_failed = True
                             logger.error("%s %s VAD failed for %s: %s", role, channel, separated, error)
                 for index, channel in enumerate(("T", "R")):
-                    channels[channel] = self._score_channel(
+                    scored = self._score_channel(
                         audio,
                         channel,
                         index,
@@ -287,6 +301,12 @@ class EvaluationPipeline:
                         baselines,
                         prototypes.get(channel),
                     )
+                    if self.wer_adapter is not None:
+                        wer = self._score_wer(audio, channel, index, scored, transcripts)
+                        if wer.status == "failed":
+                            logger.error("%s WER failed for %s: %s", channel, separated, wer.reason)
+                        scored = replace(scored, wer=wer)
+                    channels[channel] = scored
                 result = RecordingResult(
                     inference_hash,
                     self.evaluation_id,
@@ -300,6 +320,30 @@ class EvaluationPipeline:
             write_result(destination, result)
             results.append(result)
         return results, cached_paths
+
+    def _score_wer(
+        self,
+        audio: AudioTriple,
+        channel: Channel,
+        index: int,
+        prepared: ChannelResult,
+        transcripts: dict[Channel, Transcript | str],
+    ) -> WordErrorResult:
+        """Reuse reference transcripts across variants and score independently of VAD."""
+        if prepared.status == "unavailable":
+            return WordErrorResult("unavailable", reason="missing_output_channel")
+        assert self.wer_adapter is not None
+        if channel not in transcripts:
+            reference_samples = audio.reference.samples[index]
+            try:
+                transcripts[channel] = self.wer_adapter.transcribe_reference(reference_samples)
+            except AsrBackendError as exc:
+                transcripts[channel] = f"reference_{exc}"
+        reference = transcripts[channel]
+        if isinstance(reference, str):
+            return WordErrorResult("failed", reason=reference)
+        separated_samples = audio.separated.samples[index]
+        return self.wer_adapter.compare(reference, separated_samples)
 
     def _score_channel(
         self,

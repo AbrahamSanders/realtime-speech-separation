@@ -41,7 +41,7 @@ Install the extras needed for your workflow:
 ```bash
 python -m pip install -e '.[inference]'  # rtss.separate
 python -m pip install -e '.[client]'     # rtss.client (includes inference)
-python -m pip install -e '.[eval]'       # rtss.eval, including PESQ and WeSpeaker
+python -m pip install -e '.[eval]'       # rtss.eval, including PESQ, WeSpeaker, and Whisper WER
 python -m pip install -e '.[training]'   # scripts/training
 python -m pip install -e '.[data]'       # scripts/data_prep and scripts/eval_prep
 ```
@@ -204,6 +204,45 @@ and separated utterances each need three seconds of detected speech to produce
 an embedding. The score is raw cosine similarity in `[-1, 1]`. See the
 [Stage 8 implementation notes](docs/plans/eval_cli.md#stage-8--add-wespeaker-similarity)
 for model provenance and validation.
+
+#### Whisper setup
+
+Select `--metrics wer` to measure agreement between the Whisper transcripts of
+the reference and separated audio. The `eval` extra includes pywhispercpp and
+JiWER. WER runs on CPU and needs a local copy of the upstream 1.62 GB Whisper
+large-v3-turbo F16 export. Download and verify the asset once, then use it offline.
+
+```bash
+(
+    set -eu
+    whisper_cache="${XDG_CACHE_HOME:-$HOME/.cache}/rtss/asr"
+    mkdir -p "$whisper_cache"
+    whisper_cache=$(cd "$whisper_cache" && pwd)
+    whisper_staging=$(mktemp -d "$whisper_cache/.download.XXXXXX")
+    trap 'rm -rf -- "$whisper_staging"' EXIT
+    cd "$whisper_staging"
+    curl --fail --location --output ggml-large-v3-turbo.bin \
+        https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin
+    sha256sum --check <<'EOF'
+1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69  ggml-large-v3-turbo.bin
+EOF
+    mv -- ggml-large-v3-turbo.bin "$whisper_cache/"
+)
+```
+
+```bash
+rtss.eval \
+    --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata \
+    --metrics wer
+```
+
+Use `--asr_model_path` to point to a verified copy outside the cache. By default,
+Whisper detects the language from each reference channel and uses it for the
+paired separated channel. To apply a single language to both channels, use
+`--asr_language` with a Whisper language code such as `en`. Results include the
+full raw and normalized transcripts. See the
+[transcription protocol](docs/evaluation-protocol.md#transcription) and
+[Stage 9 implementation notes](docs/plans/eval_cli.md#stage-9--add-transcription-and-wer).
 
 ### Usage Notes
 
