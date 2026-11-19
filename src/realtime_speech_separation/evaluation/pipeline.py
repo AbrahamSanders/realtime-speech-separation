@@ -266,11 +266,9 @@ class EvaluationPipeline:
                             (("T", reference_speech.target), ("R", reference_speech.residual))
                         ):
                             reference_samples = audio.reference.samples[index]
-                            utterances = [
-                                reference_samples[region.interval.start : region.interval.end]
-                                for region in speech.utterances
-                            ]
-                            prototypes[channel] = self.speaker_extractor.build_reference_prototype(utterances, speech)
+                            prototypes[channel] = self.speaker_extractor.build_reference_prototype(
+                                reference_samples, speech
+                            )
                 channels = prepare_separation(audio.separated.samples, reference_speech, self.detector)
                 vad_failed = False
                 for channel, prepared in channels.items():

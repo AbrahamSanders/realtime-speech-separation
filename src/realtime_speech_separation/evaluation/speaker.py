@@ -173,13 +173,11 @@ class WeSpeaker:
             return None, "undefined", "zero_norm_embedding"
         return vector, "scored", None
 
-    def build_reference_prototype(
-        self, samples: list[NDArray[np.float32]], speech: ChannelSpeech
-    ) -> ReferencePrototype:
+    def build_reference_prototype(self, samples: NDArray[np.float32], speech: ChannelSpeech) -> ReferencePrototype:
         """Average eligible embeddings for one reference channel, retaining extraction outcomes.
 
-        Supply one mono 16 kHz waveform per region in `speech.utterances`, in
-        the same order. Regions provide recording bounds and detected speech duration.
+        `samples` is the full mono 16 kHz channel. Speech regions provide the
+        sample bounds and detected speech duration for each utterance.
         """
         if speech.error is not None:
             outcome = ReferencePrototypeExtractionResult("failed", reason="reference_vad_error")
@@ -187,11 +185,12 @@ class WeSpeaker:
 
         min_active_samples = self.parameters["min_active_samples"]
         embeddings, extractions = [], []
-        for waveform, region in zip(samples, speech.utterances, strict=True):
+        for region in speech.utterances:
             interval = region.interval
             if region.active_samples < min_active_samples:
                 extractions.append(ReferenceEmbeddingExtractionResult(interval, "ineligible", "insufficient_activity"))
                 continue
+            waveform = samples[interval.start : interval.end]
             embedding, status, reason = self(waveform)
             extractions.append(ReferenceEmbeddingExtractionResult(interval, status, reason))
             if embedding is not None:
