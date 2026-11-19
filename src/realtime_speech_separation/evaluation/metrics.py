@@ -1,8 +1,7 @@
 """Lazy CPU metric adapters for the evaluation pipeline.
 
-Adapters declare `parameters["min_active_samples"]` for the pipeline's minimum
-detected speech in a region. The `intrusive` flag indicates whether scoring
-requires a reference waveform.
+Adapters declare their interval duration threshold in `parameters`. The
+`intrusive` flag indicates whether scoring requires a reference waveform.
 """
 
 import warnings
@@ -18,6 +17,7 @@ from numpy.typing import NDArray
 
 from .audio import EVALUATION_SAMPLE_RATE
 from .reporting import content_digest
+from .speaker import ReferencePrototype, WeSpeaker
 from .types import IntervalResultStatus
 from .vad import OVERLAP_MIN_ACTIVE_SAMPLES, UTTERANCE_MIN_ACTIVE_SAMPLES
 
@@ -39,6 +39,41 @@ def finite_score(value: float) -> MetricScore:
     if not np.isfinite(value):
         return MetricScore("failed", reason="nonfinite_score")
     return MetricScore("scored", value)
+
+
+class SpeakerCosine:
+    """Score separated utterances against one channel's reference prototype."""
+
+    intrusive: Literal[False] = False
+
+    def __init__(self, extractor: WeSpeaker) -> None:
+        """Share the extractor and its resolved settings across channel scorers."""
+        self._extractor = extractor
+        self._prototype: ReferencePrototype | None = None
+        self.parameters = extractor.parameters
+        self.versions = extractor.versions
+
+    def with_prototype(self, prototype: ReferencePrototype) -> "SpeakerCosine":
+        """Bind a channel prototype for scoring while sharing the extractor."""
+        scorer = SpeakerCosine(self._extractor)
+        scorer._prototype = prototype
+        return scorer
+
+    def __call__(self, estimate: NDArray[np.float32]) -> MetricScore:
+        """Return raw cosine or the reason an eligible 16 kHz utterance could not score."""
+        assert self._prototype is not None
+        target = self._prototype.unit_vector
+        if target is None:
+            outcome = self._prototype.outcome
+            status = "failed" if outcome.status == "failed" else "undefined"
+            return MetricScore(status, reason=outcome.reason)
+        embedding, status, reason = self._extractor(estimate)
+        if embedding is None:
+            return MetricScore(status, reason=reason)
+        unit_embedding = embedding / np.linalg.norm(embedding)
+        cosine = np.dot(target, unit_embedding)
+        clipped_cosine = np.clip(cosine, -1.0, 1.0)
+        return MetricScore("scored", float(clipped_cosine))
 
 
 def centered_zero_energy(samples: NDArray[np.float32]) -> bool:

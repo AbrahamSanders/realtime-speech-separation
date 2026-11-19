@@ -14,6 +14,7 @@ from realtime_speech_separation.eval_cli import main
 from realtime_speech_separation.evaluation import pipeline
 from realtime_speech_separation.evaluation.metrics import MetricScore
 from realtime_speech_separation.evaluation.reporting import parse_result, result_path
+from realtime_speech_separation.evaluation.speaker import MODEL_NAME, WeSpeaker
 from realtime_speech_separation.evaluation.types import Interval
 from realtime_speech_separation.evaluation.vad import (
     OVERLAP_MIN_ACTIVE_SAMPLES,
@@ -37,6 +38,10 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         visqol_model_digest="model-a",
         dnsmos_model_digests={"dnsmos/model_v8.onnx": "p808-a", "dnsmos/sig_bak_ovr.onnx": "companion-a"},
         dnsmos_scores=[],
+        speaker_model_digest="speaker-a",
+        speaker_embeddings={},
+        speaker_errors={},
+        speaker_calls=[],
     )
 
     class Detector:
@@ -106,12 +111,35 @@ def core_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         score.model_digests = state.dnsmos_model_digests.copy()
         return score
 
+    class FakeSpeaker(WeSpeaker):
+        """Provide a fake extractor with real pipeline eligibility and cosine scoring."""
+
+        def __init__(self, model_path):
+            """Track initialization and supply provenance without loading the ONNX session."""
+            state.loads["speaker"] += 1
+            state.speaker_model_path = model_path
+            self.backend_version = "test-speaker"
+            self.versions = {"torchaudio": "test", "onnxruntime": "test"}
+            self.parameters = {"min_active_samples": 48000}
+            self.model_digest = state.speaker_model_digest
+
+        def __call__(self, samples):
+            """Resolve an extraction outcome by waveform marker and log the slice length."""
+            marker = round(float(samples[0]), 2)
+            state.speaker_calls.append((marker, len(samples)))
+            if marker in state.speaker_errors:
+                status, reason = state.speaker_errors[marker]
+                return None, status, reason
+            vector = state.speaker_embeddings.get(marker, (1, 0))
+            return np.array(vector, dtype=np.float64), "scored", None
+
     monkeypatch.setattr(pipeline, "SileroVad", Detector)
     monkeypatch.setattr(pipeline, "SiSdr", lambda: adapter_factory("si_sdr"))
     monkeypatch.setattr(pipeline, "Stoi", lambda: adapter_factory("stoi"))
     monkeypatch.setattr(pipeline, "Pesq", lambda: adapter_factory("pesq"))
     monkeypatch.setattr(pipeline, "Visqol", lambda: adapter_factory("visqol"))
     monkeypatch.setattr(pipeline, "DnsmosP808", dnsmos_factory)
+    monkeypatch.setattr(pipeline, "WeSpeaker", FakeSpeaker)
     return state
 
 
@@ -441,14 +469,195 @@ def test_cli_checks_detected_activity_before_scoring(tmp_path, core_runtime, met
     assert (candidate.status, candidate.reason) == ("ineligible", "insufficient_activity")
 
 
-@pytest.mark.parametrize(
-    "selection", [[], ["--metrics", "all"], ["--metrics", "speaker_cosine"], ["--metrics", "core", "wer"]]
-)
+@pytest.mark.parametrize("selection", [[], ["--metrics", "all"], ["--metrics", "wer"], ["--metrics", "core", "wer"]])
 def test_unimplemented_selections_fail_before_preflight(tmp_path, core_runtime, selection, caplog) -> None:
     """All remains the full protocol and cannot silently fall back to core."""
     assert main(["--input_dir", str(tmp_path), *selection]) == 1
     assert not core_runtime.loads
     assert "not implemented" in caplog.text
+    assert not list(tmp_path.iterdir())
+
+
+def test_speaker_prototypes_use_raw_equal_weights_and_are_scoped_to_each_recording(tmp_path, core_runtime) -> None:
+    """Three-second rules, waveform slices, channel assignment, and cache scope work together."""
+    first = write_triple(tmp_path, name="first", variants=("a", "b"), sample_count=196004)
+    second = write_triple(tmp_path, name="second", sample_count=196004)
+    second_reference = second.with_stem("second_reference")
+    samples, rate = sf.read(second_reference, dtype="float32")
+    samples[0, 0] = 6
+    sf.write(second_reference, samples, rate, subtype="FLOAT")
+    core_runtime.vad_intervals = {
+        1: (Interval(0, 24000), Interval(24001, 48000), Interval(64001, 112001), Interval(128002, 196004)),
+        2: (Interval(0, 48000),),
+        3: (Interval(0, 20000), Interval(20001, 48001), Interval(64002, 84002), Interval(84003, 112002)),
+        4: (Interval(0, 48000),),
+        6: (Interval(0, 48000),),
+    }
+    core_runtime.speaker_embeddings = {
+        1.07: (4, 0),
+        1.13: (0, 1),
+        2: (0, -1),
+        3: (-1, 0),
+        4: (0, -1),
+        6: (-1, 0),
+    }
+    model = tmp_path / MODEL_NAME
+    args = ["--input_dir", str(tmp_path), "--metrics", "speaker_cosine", "--speaker_model_path", str(model)]
+    assert main(args) == 0
+    assert core_runtime.loads == {"vad": 1, "speaker": 1}
+    assert core_runtime.speaker_model_path == model
+    assert Counter(core_runtime.speaker_calls) == {
+        (1.07, 48000): 1,
+        (1.13, 68002): 1,
+        (2, 48000): 2,
+        (3, 48001): 3,
+        (4, 48000): 3,
+        (6, 48000): 1,
+    }
+    records = results_in(tmp_path)
+    assert len(records) == 3
+    for record in records:
+        target = record.channels["T"]
+        assert target.prototype.status == "available"
+        assert record.channels["R"].metrics["speaker_cosine"].interval_results[0].value == 1.0
+        eligible, too_short = target.metrics["speaker_cosine"].interval_results
+        assert (eligible.interval, eligible.interval_source, eligible.status) == (
+            Interval(0, 48001),
+            "separated_utterance",
+            "scored",
+        )
+        assert (too_short.interval, too_short.status, too_short.reason) == (
+            Interval(64002, 112002),
+            "ineligible",
+            "insufficient_activity",
+        )
+        if record.sources.mixture.path == first.name:
+            assert eligible.value == pytest.approx(-4 / np.sqrt(17))
+            rejected, *accepted = target.prototype.extractions
+            assert (rejected.interval, rejected.status, rejected.reason) == (
+                Interval(0, 48000),
+                "ineligible",
+                "insufficient_activity",
+            )
+            assert [item.status for item in accepted] == ["scored", "scored"]
+        else:
+            assert eligible.value == 1.0
+        assert record.configuration.model_digests[MODEL_NAME] == "speaker-a"
+        assert record.configuration.speaker_backend_version == "test-speaker"
+        assert record.configuration.metric_backend_versions["torchaudio"] == "test"
+        assert record.configuration.parameters["speaker_cosine"]["min_active_samples"] == 48000
+
+    core_runtime.speaker_calls.clear()
+    assert main(args) == 0
+    assert not core_runtime.speaker_calls
+    core_runtime.speaker_model_digest = "speaker-b"
+    assert main(args) == 0
+    assert core_runtime.speaker_calls
+    assert len({record.evaluation_id for record in results_in(tmp_path)}) == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "prototype_status", "metric_status", "reason", "exit_code"),
+    [
+        ("short_reference", "unavailable", "undefined", "no_eligible_reference_utterances", 0),
+        ("zero_reference", "unavailable", "undefined", "zero_norm_reference_embedding", 0),
+        ("zero_mean", "unavailable", "undefined", "zero_norm_prototype", 0),
+        ("reference_backend", "failed", "failed", "reference_embedding_error", 1),
+        ("reference_nonfinite", "failed", "failed", "reference_embedding_error", 1),
+        ("reference_vad", "failed", "failed", "reference_vad_error", 1),
+        ("separated_vad", "available", "failed", "separated_vad_error", 1),
+        ("zero_separation", "available", "undefined", "zero_norm_embedding", 0),
+        ("separated_backend", "available", "failed", "speaker_backend_error: test failure", 1),
+    ],
+)
+def test_speaker_unavailable_and_failed_outcomes(
+    tmp_path, core_runtime, failure, prototype_status, metric_status, reason, exit_code
+) -> None:
+    """Retain interval outcomes, healthy scores, coverage, and backend retry semantics."""
+    write_triple(tmp_path, sample_count=120000)
+    core_runtime.vad_intervals = {
+        1: (Interval(0, 47999 if failure == "short_reference" else 48000),),
+        2: (Interval(0, 48000),),
+        3: (Interval(0, 48000), Interval(64001, 112001)),
+        4: (Interval(0, 48000),),
+    }
+    if failure in ("reference_backend", "reference_nonfinite", "zero_mean"):
+        core_runtime.vad_intervals[1] += (Interval(64001, 112001),)
+        if failure == "zero_mean":
+            core_runtime.speaker_embeddings[1.11] = (-1, 0)
+        else:
+            extraction_reason = (
+                "nonfinite_embedding" if failure == "reference_nonfinite" else "speaker_backend_error: test failure"
+            )
+            core_runtime.speaker_errors[1.11] = ("failed", extraction_reason)
+    elif failure in ("reference_vad", "separated_vad"):
+        core_runtime.vad_failure = 1 if failure == "reference_vad" else 3
+    elif failure in ("zero_reference", "zero_separation"):
+        marker = 1 if failure == "zero_reference" else 3
+        core_runtime.speaker_errors[marker] = ("undefined", "zero_norm_embedding")
+    elif failure == "separated_backend":
+        core_runtime.speaker_errors[3] = ("failed", "speaker_backend_error: test failure")
+
+    args = ["--input_dir", str(tmp_path), "--metrics", "speaker_cosine", "stoi", "--speaker_model_path", MODEL_NAME]
+    assert main(args) == exit_code
+    (record,) = results_in(tmp_path)
+    target = record.channels["T"]
+    metric = target.metrics["speaker_cosine"]
+    assert target.prototype.status == prototype_status
+    if failure == "separated_vad":
+        assert (metric.status, metric.reason, metric.interval_results) == (metric_status, reason, ())
+    else:
+        first, second = metric.interval_results
+        assert (first.status, first.value, first.reason) == (metric_status, None, reason)
+        if prototype_status == "available":
+            assert second.value == 1.0
+        else:
+            assert second.status == metric_status
+            assert not any(marker >= 3 and marker < 4 for marker, _ in core_runtime.speaker_calls)
+    if failure in ("reference_backend", "reference_nonfinite"):
+        assert [item.status for item in target.prototype.extractions] == ["scored", "failed"]
+    if failure == "zero_reference":
+        assert target.prototype.extractions[0].reason == "zero_norm_embedding"
+    assert target.metrics["stoi"].status == ("failed" if failure == "reference_vad" else "enabled")
+    assert record.channels["R"].metrics["speaker_cosine"].interval_results[0].value == 1.0
+
+    core_runtime.speaker_calls.clear()
+    assert main(args) == exit_code
+    assert bool(core_runtime.speaker_calls) == bool(exit_code)
+
+
+def test_speaker_target_only_preserves_reference_prototype_coverage(tmp_path, core_runtime, monkeypatch) -> None:
+    """Target-only audio still has two references and one eligible score population."""
+    write_triple(tmp_path, channels=1, sample_count=48000)
+    core_runtime.vad_intervals = {marker: (Interval(0, 48000),) for marker in (1, 2, 3)}
+    model = tmp_path / MODEL_NAME
+    monkeypatch.setattr(pipeline, "cached_speaker_model", lambda: model)
+    args = ["--input_dir", str(tmp_path), "--metrics", "speaker_cosine"]
+    assert main(args) == 0
+    assert core_runtime.speaker_model_path == model
+    (record,) = results_in(tmp_path)
+    residual = record.channels["R"]
+    assert residual.prototype.status == "available"
+    assert residual.metrics["speaker_cosine"].status == "unavailable"
+    assert residual.metrics["speaker_cosine"].interval_results == ()
+    (summary_path,) = tmp_path.glob("summary_*.json")
+    channels = json.loads(summary_path.read_text())["channels"]
+    assert channels["T"]["metrics"]["speaker_cosine"]["distribution"]["mean"] == 1.0
+    assert channels["R"]["metrics"]["speaker_cosine"]["coverage"]["candidates"] == 0
+    assert channels["R"]["prototype"]["coverage"]["candidates"] == 1
+
+
+def test_speaker_cache_failure_fails_preflight(tmp_path, core_runtime, monkeypatch, caplog) -> None:
+    """A failed cache download stops the run before loading runtimes or writing results."""
+
+    def fail_cache():
+        """Simulate failed model provisioning before loading the extractor."""
+        raise RuntimeError("Cannot cache WeSpeaker model")
+
+    monkeypatch.setattr(pipeline, "cached_speaker_model", fail_cache)
+    assert main(["--input_dir", str(tmp_path), "--metrics", "speaker_cosine"]) == 1
+    assert "Cannot cache WeSpeaker model" in caplog.text
+    assert not core_runtime.loads
     assert not list(tmp_path.iterdir())
 
 

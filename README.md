@@ -41,7 +41,7 @@ Install the extras needed for your workflow:
 ```bash
 python -m pip install -e '.[inference]'  # rtss.separate
 python -m pip install -e '.[client]'     # rtss.client (includes inference)
-python -m pip install -e '.[eval]'       # rtss.eval, including wideband PESQ
+python -m pip install -e '.[eval]'       # rtss.eval, including PESQ and WeSpeaker
 python -m pip install -e '.[training]'   # scripts/training
 python -m pip install -e '.[data]'       # scripts/data_prep and scripts/eval_prep
 ```
@@ -183,6 +183,28 @@ EOF
 See the [Stage 7 implementation notes](docs/plans/eval_cli.md#stage-7--add-dnsmos-p808)
 for model provenance and runtime details.
 
+#### WeSpeaker setup
+
+Install the `eval` extra to use the multilingual VoxBlink2 SimAMResNet34 ONNX
+export. The extra includes CPU ONNX Runtime and the TorchAudio frontend. When
+choosing PyTorch and TorchAudio builds manually, use compatible builds for the
+same CPU or CUDA variant. Evaluation runs on CPU.
+[TorchAudio compatibility](https://docs.pytorch.org/audio/main/installation.html)
+
+```bash
+rtss.eval \
+    --input_dir=output/eval/dataset_magicodec_131k_60s_dev_metadata \
+    --metrics core speaker_cosine
+```
+
+The first run downloads and verifies the export from ModelScope. A valid cache
+entry under `${XDG_CACHE_HOME:-$HOME/.cache}/rtss/wespeaker/` serves later runs
+offline. You can also supply `--speaker_model_path` to use a local copy. Reference
+and separated utterances each need three seconds of detected speech to produce
+an embedding. The score is raw cosine similarity in `[-1, 1]`. See the
+[Stage 8 implementation notes](docs/plans/eval_cli.md#stage-8--add-wespeaker-similarity)
+for model provenance and validation.
+
 ### Usage Notes
 
 By default, `rtss.separate` and `rtss.eval` will skip any already processed files.
@@ -213,4 +235,5 @@ Direct runtime dependencies can be found in `pyproject.toml`.
 The `dev` extra installs pytest & Ruff. Tests run offline and generate their audio in
 temporary directories. CI runs the same checks on Python 3.11 and 3.14.
 
-[MIT license](LICENSE).
+[MIT license](LICENSE). The adapted WeSpeaker frontend carries the
+[Apache 2.0 license](LICENSE-WeSpeaker).

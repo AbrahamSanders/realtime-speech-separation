@@ -8,8 +8,9 @@ from importlib.metadata import version
 from pathlib import Path
 
 from .audio import MIN_RECORDING_SECONDS, AudioTriple, load_audio_triple
-from .metrics import DnsmosP808, MetricScore, Pesq, SiSdr, Stoi, Visqol, centered_zero_energy
+from .metrics import DnsmosP808, MetricScore, Pesq, SiSdr, SpeakerCosine, Stoi, Visqol, centered_zero_energy
 from .reporting import compatible_result, content_digest, evaluation_identity, result_path, write_result
+from .speaker import MODEL_NAME, ReferencePrototype, WeSpeaker, cached_speaker_model
 from .types import (
     ALL_METRICS,
     IMPROVEMENT_METRICS,
@@ -51,8 +52,9 @@ METRIC_FAMILIES = {
     "pesq": "pesq",
     "visqol": "visqol",
     "dnsmos_p808": "dnsmos_p808",
+    "speaker_cosine": "speaker_cosine",
 }
-IntervalAdapter = SiSdr | Stoi | Pesq | Visqol | DnsmosP808
+IntervalAdapter = SiSdr | Stoi | Pesq | Visqol | DnsmosP808 | SpeakerCosine
 
 
 class EvaluationUnavailableError(RuntimeError):
@@ -82,15 +84,22 @@ def _resolve_metrics(names: Sequence[str]) -> tuple[Metric, ...]:
     return tuple(sorted(selected))
 
 
-def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipeline":
-    """Preflight selected adapters and the packaged VAD once; never download assets."""
+def create_pipeline(
+    input_dir: Path, metrics: Sequence[str], *, speaker_model_path: Path | None = None
+) -> "EvaluationPipeline":
+    """Preflight selected adapters, provisioning the default speaker model when needed."""
     metrics = _resolve_metrics(metrics)
     adapters: dict[str, IntervalAdapter] = {}
+    speaker_extractor = None
     # Import and initialize only requested metric families, before any output writes.
     try:
+        if "speaker_cosine" in metrics:
+            model_path = cached_speaker_model() if speaker_model_path is None else speaker_model_path.expanduser()
+            speaker_extractor = WeSpeaker(model_path)
+            adapters["speaker_cosine"] = SpeakerCosine(speaker_extractor)
         families = {METRIC_FAMILIES[name] for name in metrics if name in METRIC_FAMILIES}
         factories = {"si_sdr": SiSdr, "stoi": Stoi, "pesq": Pesq, "visqol": Visqol, "dnsmos_p808": DnsmosP808}
-        for family in sorted(families):
+        for family in sorted(families - adapters.keys()):
             adapter = factories[family]()
             if "min_active_samples" not in getattr(adapter, "parameters", {}):
                 raise RuntimeError(f"{family} adapter must declare min_active_samples")
@@ -107,6 +116,9 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
         model_digests["visqol_speech.tflite"] = adapters["visqol"].model_digest
     if "dnsmos_p808" in adapters:
         model_digests.update(adapters["dnsmos_p808"].model_digests)
+    parameters = {name: adapter.parameters for name, adapter in adapters.items()}
+    if speaker_extractor is not None:
+        model_digests[MODEL_NAME] = speaker_extractor.model_digest
     configuration = EvaluationConfig(
         metrics=metrics,
         parameters={
@@ -121,13 +133,14 @@ def create_pipeline(input_dir: Path, metrics: Sequence[str]) -> "EvaluationPipel
                 "activity_frame_samples": ACTIVITY_FRAME_SAMPLES,
                 "activity_majority": "strict_actual_frame_span",
             },
-            **{name: adapter.parameters for name, adapter in adapters.items()},
+            **parameters,
         },
         metric_backend_versions=versions,
         vad_backend_version=detector.backend_version,
+        speaker_backend_version=speaker_extractor.backend_version if speaker_extractor is not None else None,
         model_digests=model_digests,
     )
-    return EvaluationPipeline(input_dir, configuration, detector, adapters)
+    return EvaluationPipeline(input_dir, configuration, detector, adapters, speaker_extractor)
 
 
 def _interval_result(
@@ -159,8 +172,8 @@ def _interval_result(
 class EvaluationPipeline:
     """Sequential per-mixture evaluation with injectable VAD and interval adapters.
 
-    Each call scopes reference timing and baseline caches to one mixture. Failed
-    results are persisted for diagnosis and recomputed on a later invocation.
+    Each call scopes reference timing, prototypes, and baseline caches to one
+    mixture. Failed results are persisted for diagnosis and recomputed later.
     """
 
     def __init__(
@@ -169,6 +182,7 @@ class EvaluationPipeline:
         configuration: EvaluationConfig,
         detector: SpeechDetector,
         adapters: dict[str, IntervalAdapter],
+        speaker_extractor: WeSpeaker | None = None,
     ) -> None:
         """Keep shared resources and resolved identity; do not load audio yet."""
         self.input_dir = input_dir
@@ -176,6 +190,7 @@ class EvaluationPipeline:
         self.evaluation_id = evaluation_identity(configuration)
         self.detector = detector
         self.adapters = adapters
+        self.speaker_extractor = speaker_extractor
 
     def _source(self, path: Path) -> AudioSource:
         """Fingerprint bytes independently of decoding, retaining missing paths."""
@@ -199,6 +214,7 @@ class EvaluationPipeline:
         mixture_source, reference_source = self._source(mixture), self._source(reference)
         reference_speech = None
         baselines = {}
+        prototypes: dict[Channel, ReferencePrototype] = {}
         for separated, inference_hash in separations:
             sources = AudioSources(mixture_source, reference_source, self._source(separated))
             destination = result_path(mixture, inference_hash, self.evaluation_id)
@@ -244,6 +260,17 @@ class EvaluationPipeline:
                 sources = AudioSources(*loaded_sources)
                 if reference_speech is None:
                     reference_speech = prepare_reference(audio.reference.samples, self.detector)
+                    # Share one reference prototype per channel across this mixture's variants.
+                    if self.speaker_extractor is not None:
+                        for index, (channel, speech) in enumerate(
+                            (("T", reference_speech.target), ("R", reference_speech.residual))
+                        ):
+                            reference_samples = audio.reference.samples[index]
+                            utterances = [
+                                reference_samples[region.interval.start : region.interval.end]
+                                for region in speech.utterances
+                            ]
+                            prototypes[channel] = self.speaker_extractor.build_reference_prototype(utterances, speech)
                 channels = prepare_separation(audio.separated.samples, reference_speech, self.detector)
                 vad_failed = False
                 for channel, prepared in channels.items():
@@ -254,7 +281,13 @@ class EvaluationPipeline:
                             logger.error("%s %s VAD failed for %s: %s", role, channel, separated, error)
                 for index, channel in enumerate(("T", "R")):
                     channels[channel] = self._score_channel(
-                        audio, channel, index, channels[channel], reference_speech.overlap, baselines
+                        audio,
+                        channel,
+                        index,
+                        channels[channel],
+                        reference_speech.overlap,
+                        baselines,
+                        prototypes.get(channel),
                     )
                 result = RecordingResult(
                     inference_hash,
@@ -278,6 +311,7 @@ class EvaluationPipeline:
         prepared: ChannelResult,
         reference_overlap: tuple[SpeechRegion, ...] | None,
         baselines: dict[tuple[str, Channel, Interval], MetricScore],
+        prototype: ReferencePrototype | None,
     ) -> ChannelResult:
         """Slice identical bounds without permutation and pool no recording means."""
         metrics = dict(prepared.metrics)
@@ -289,7 +323,7 @@ class EvaluationPipeline:
                 metrics[name] = MetricResult("unavailable", reason="missing_output_channel")
                 continue
             # Obtain the candidate regions and preserve failures of their VAD sources.
-            if name == "dnsmos_p808":
+            if name in ("dnsmos_p808", "speaker_cosine"):
                 if prepared.separated_vad_error is not None:
                     metrics[name] = MetricResult("failed", reason="separated_vad_error")
                     continue
@@ -306,6 +340,12 @@ class EvaluationPipeline:
                 regions, source = prepared.reference_utterances, "reference_utterance"
             family = METRIC_FAMILIES[name]
             adapter = self.adapters[family]
+            if isinstance(adapter, SpeakerCosine):
+                assert prototype is not None
+                if not regions and prototype.outcome.status == "failed":
+                    metrics[name] = MetricResult("failed", reason=prototype.outcome.reason)
+                    continue
+                adapter = adapter.with_prototype(prototype)
             min_active_samples = adapter.parameters["min_active_samples"]
             candidates = []
             for region in regions:
@@ -344,4 +384,10 @@ class EvaluationPipeline:
                 if centered_zero_energy(audio.separated.samples[index, region.interval.start : region.interval.end])
             )
         activity = prepared.activity if "activity" in self.configuration.metrics else ActivityResult()
-        return replace(prepared, metrics=metrics, activity=activity, separated_missing_utterances=missing)
+        return replace(
+            prepared,
+            metrics=metrics,
+            activity=activity,
+            separated_missing_utterances=missing,
+            prototype=prototype.outcome if prototype is not None else prepared.prototype,
+        )

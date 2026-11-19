@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Realtime speech separation."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "LICENSE-WeSpeaker"]
 dependencies = [
     "librosa>=0.10.2",
     "numpy>=1.26",
@@ -40,7 +40,8 @@ eval = [
     "pystoi>=0.4.1",
     "requests>=2.32.5",
     "silero-vad>=6.2.1",
-    "torch>=2.2",
+    "torch>=2.11",
+    "torchaudio>=2.11",
     "torchmetrics>=1.8.2",
 ]
 training = [

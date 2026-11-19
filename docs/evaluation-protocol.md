@@ -96,9 +96,11 @@ channels. Record the resolved language and decoding settings.
 #### Speaker Embeddings
 
 [WeSpeaker toolkit](https://github.com/wenet-e2e/wespeaker) is used to extract speaker
-embeddings using a model appropriate for multilingual speech. Reference utterances
-must contain at least 3 seconds of raw VAD-active speech to contribute to a
-prototype; silent gaps inside a merged utterance do not count toward this minimum.
+embeddings using a model appropriate for multilingual speech. Both reference and
+separated utterances must contain at least 3 seconds of raw VAD-active speech to
+provide enough speech for estimating speaker identity. Silent gaps inside a
+merged utterance do not count toward this minimum. Embed the full utterance span
+once the detected speech meets the threshold.
 The eligible reference embeddings on T and R are separately averaged with equal
 utterance weight **within each evaluation recording** to create target and residual
 speaker prototypes. If none qualifies on a channel, its prototype and speaker
@@ -110,9 +112,8 @@ utterance embedding before averaging. A failed required embedding extraction
 makes that channel's prototype unavailable rather than dropping the utterance
 and constructing a different prototype. A zero-norm prototype is also unavailable.
 
-The separated embeddings on T and R are taken for each utterance with a span of
-at least 3 seconds to create utterance-level speaker embeddings. Keep the selected
-model and frontend fixed across separator comparisons.
+Extract one embedding per eligible separated utterance on T and R. Keep the
+selected model and frontend fixed across separator comparisons.
 
 #### Silent Channels and Missing Speech
 
@@ -201,6 +202,7 @@ We then measure:
 ### Speaker Embedding Cosine Similarity
 
 Speaker embedding similarity measures how well the separated channels preserve the identities of the reference speakers.
+Report the raw cosine similarity in `[-1, 1]`.
 
 We measure:
 

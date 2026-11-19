@@ -62,7 +62,7 @@ def run_eval(args: argparse.Namespace) -> bool:
     """Evaluate selected triples and reports; return whether any input/backend failed."""
     if not Path(args.input_dir).is_dir():
         raise EvaluationUnavailableError(f"Input directory does not exist or is not a directory: {args.input_dir}")
-    pipeline = create_pipeline(Path(args.input_dir), args.metrics)
+    pipeline = create_pipeline(Path(args.input_dir), args.metrics, speaker_model_path=args.speaker_model_path)
     metrics = pipeline.configuration.metrics
     logger.warning("Running a partial protocol evaluation with metrics: %s", ", ".join(metrics))
     input_files = get_input_files(args.input_dir, args.input_filter)
@@ -130,6 +130,11 @@ def main(argv: list[str] | None = None) -> int:
         default=["all"],
         choices=["all", "core", *ALL_METRICS],
         help="Metric selection (default: all). Use core for the implemented partial protocol.",
+    )
+    input_group.add_argument(
+        "--speaker_model_path",
+        type=Path,
+        help="Optional local WeSpeaker ONNX model path. By default, download and cache the VoxBlink2 model.",
     )
 
     output_group = parser.add_argument_group("Output Arguments")

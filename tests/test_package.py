@@ -29,6 +29,7 @@ def test_import_outside_repository(tmp_path: Path) -> None:
             "import realtime_speech_separation.evaluation.audio; "
             "import realtime_speech_separation.evaluation.vad; "
             "import realtime_speech_separation.evaluation.metrics; "
+            "import realtime_speech_separation.evaluation.speaker; "
             "import realtime_speech_separation.evaluation.pipeline; "
             "import realtime_speech_separation.eval_cli; "
             "assert not {'torch', 'transformers', 'codec_bpe', 'llama_cpp', "

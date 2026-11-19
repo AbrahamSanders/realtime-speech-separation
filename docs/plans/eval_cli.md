@@ -1,6 +1,6 @@
 # Evaluation CLI implementation plan
 
-Stages 1–7 are implemented. Speaker and ASR backends remain planned.
+Stages 1–8 are implemented. The ASR backend remains planned.
 
 ## Objective and scope
 
@@ -59,14 +59,14 @@ backend detects speech (Silero), the speaker backend extracts embeddings
 | PESQ | `pesq.pesq(16000, reference, estimate, mode="wb")`, exception mode. | Native extension; check Python/NumPy and build compatibility. [Wrapper](https://github.com/ludlows/PESQ). |
 | ViSQOL | Official Python API, speech mode and matching model asset. | Native installation; use the array API. [Setup/API](https://github.com/google/visqol#python-api-usage). |
 | DNSMOS-P.808 | TorchMetrics `deep_noise_suppression_mean_opinion_score`, `personalized=False`. | Select P.808 from the four returned components; add CPU ONNX Runtime and requests. [API](https://github.com/Lightning-AI/torchmetrics/blob/master/src/torchmetrics/functional/audio/dnsmos.py). |
-| Speaker embeddings | WeSpeaker multilingual VoxBlink2 SimAMResNet34 ONNX model. | Use CPU ONNX Runtime and the official `torchaudio.compliance.kaldi` frontend; pin matching torch/torchaudio builds. [Models](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md?plain=1), [frontend](https://github.com/wenet-e2e/wespeaker/blob/master/wespeaker/bin/infer_onnx.py). |
+| Speaker embeddings | WeSpeaker multilingual VoxBlink2 SimAMResNet34 ONNX model. | Use CPU ONNX Runtime and the official `torchaudio.compliance.kaldi` frontend with ABI-compatible PyTorch and TorchAudio builds. [Models](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md?plain=1), [frontend](https://github.com/wenet-e2e/wespeaker/blob/master/wespeaker/bin/infer_onnx.py). |
 | Transcription | In-process `pywhispercpp.model.Model`, local `ggml-large-v3-turbo.bin`. | Pass 16 kHz float32 arrays; check binding/native build compatibility. [API](https://github.com/absadiki/pywhispercpp/blob/main/pywhispercpp/model.py). |
 | WER | `jiwer.process_words`, JiWER 4+. | Retain edit counts, including insertions against empty references. [Usage](https://jitsi.github.io/jiwer/usage/). |
 | Intervals, activity, cosine, aggregation | Small NumPy/Python helpers. | Reuse libraries for signal metrics, features, neural inference, and edit distance. |
 
-Use `eval` for Silero/TorchMetrics/pystoi/PESQ and the DNSMOS dependencies,
-`eval-speaker` for the speaker frontend, and `eval-asr` for pywhispercpp/JiWER.
-The latter extras include `eval`. Document ViSQOL native setup separately.
+Use `eval` for Silero, TorchMetrics, pystoi, PESQ, DNSMOS, and the speaker
+frontend. The planned `eval-asr` extra includes `eval` and adds pywhispercpp
+and JiWER. Document ViSQOL native setup separately.
 Replace Asteroid when core metrics land; retain pandas only if reporting uses it.
 Avoid broad toolkit extras and changes to unrelated dependency groups.
 
@@ -112,8 +112,9 @@ so package import and CLI help work without those external libraries.
 
 - Preflight requested packages/assets and load each model/session once. Default
   to CPU and use backend-provided inference handling. Leave runtime thread
-  configuration to the user and external libraries. Provision assets separately;
-  evaluation must run offline without automatic downloads or GPU selection.
+  configuration to the user and external libraries. Reuse local assets for offline
+  evaluation. The default WeSpeaker export downloads during preflight when its
+  verified cache entry is missing. Evaluation uses CPU.
 - Validate audio once at the loading boundary. Represent missing/unreadable files
   and invalid waveforms with one recording-error record containing path and
   reason; reuse decoder exceptions for file errors.
@@ -832,7 +833,7 @@ both results.
 
 - Add `speaker.py` for the selected SimAMResNet34 ONNX model and local model path.
   Reuse the official filterbank frontend, amplitude scaling, frame settings, and
-  mean normalization; add matching torchaudio/CPU ONNX Runtime to `eval-speaker`.
+  mean normalization. Include compatible TorchAudio and CPU ONNX Runtime in `eval`.
 - Implement the protocol's reference-prototype and separated-utterance rules,
   including the agreed embedding average. Report unavailable prototypes,
   zero-norm embeddings, and extraction failures.
@@ -840,10 +841,94 @@ both results.
   Preserve upstream attribution when adapting its inference example.
 
 **Tests:** deterministic fake embeddings verify per-recording/channel scope,
-equal weighting, active-duration versus span eligibility at the 3-second boundary,
+equal weighting, detected speech eligibility at the 3-second boundary,
 missing prototypes, and negative cosine. Before accepting this frontend, compare
 embeddings with the official extractor using the same model/configuration in an
 opt-in local check.
+
+**Implementation notes**
+
+- `--metrics speaker_cosine` defaults to a revision-specific model cache under
+  `${XDG_CACHE_HOME:-$HOME/.cache}/rtss/wespeaker/`. A missing or corrupt entry
+  triggers a standard-library HTTPS download from ModelScope. The download is
+  verified before it is published atomically, and an optional
+  `--speaker_model_path` bypasses the cache. Preflight fingerprints the model
+  and checks for the variable-length float32 `feats` input and 256-dimensional
+  `embs` output. The model's SHA-256, frontend and eligibility settings, and
+  runtime versions are included in the evaluation ID. The documented asset is
+  the VoxBlink2-only export at ModelScope dataset revision
+  `548e87a3fa9fb727a7d08d1387e1f710093c56dd`, SHA-256
+  `1564bb8490c7f7759e293bbc2b2d326b5dc2b79f24e47a0d57f4a24064a58ad9`.
+  [CLI and cache setup](../../README.md#wespeaker-setup) ·
+  [WeSpeaker model catalog](https://github.com/wenet-e2e/wespeaker/blob/9fecd6cb4f47475d01761d87c826298dff4ef18c/docs/pretrained.md)
+- The adapter follows the official ONNX example using 16 kHz float32 mono
+  audio, waveform scaling by 32768, 80 Kaldi mel bins, 25 ms Hamming windows
+  with a 10 ms shift, zero dither, no energy feature, and utterance-level mean
+  subtraction. One CPU ONNX session serves the invocation and uses runtime
+  thread defaults. The frontend's upstream attribution and license are shipped
+  with the package. `eval` uses `torch>=2.11` and `torchaudio>=2.11` for
+  TorchAudio's stable PyTorch ABI and includes CPU ONNX Runtime
+  (`onnxruntime>=1.20.1`). TorchCodec is unnecessary for the
+  in-memory frontend. [Official ONNX example](https://github.com/wenet-e2e/wespeaker/blob/fb2325c1769958ccf979667862193419c9fc0551/wespeaker/bin/infer_onnx.py) ·
+  [TorchAudio compatibility](https://docs.pytorch.org/audio/main/installation.html)
+- Reference embeddings use complete merged utterance spans and require at
+  least 48,000 raw VAD-active samples. Each reference channel's raw vectors
+  receive equal weight before normalizing their mean. Both reference outcomes
+  are reported for target-only output. Prototypes are shared across one
+  mixture's variants. The non-intrusive `SpeakerCosine` metric uses a
+  channel-bound prototype and the shared interval scoring loop. Separated
+  candidates also require 48,000 raw VAD-active samples. A merged gap counts
+  toward the waveform span passed to the extractor and is excluded from the
+  eligibility calculation. The activity requirement replaces the previous
+  span threshold in the evaluation identity so cached span-based results
+  are recomputed.
+- Reporting assumptions are that an eligible separated candidate with an
+  unavailable prototype is undefined. A failed reference VAD or required
+  extraction marks eligible separated candidates as failed. Short candidates
+  retain their ineligibility. A zero-norm reference embedding makes the
+  prototype unavailable, as does a zero-norm mean. A zero-norm separated
+  embedding is undefined, and nonfinite embeddings are extraction failures.
+  Healthy utterances and channels retain their scores. Results with backend
+  failures are recomputed on the next invocation.
+
+After running a speaker evaluation to populate the cache, copy the model and
+the pinned official `infer_onnx.py` into a temporary directory for the opt-in
+frontend comparison.
+
+```bash
+wespeaker_assets=$(mktemp -d)
+wespeaker_cache="${XDG_CACHE_HOME:-$HOME/.cache}/rtss/wespeaker/548e87a3fa9fb727a7d08d1387e1f710093c56dd"
+cp "$wespeaker_cache/voxblink2_samresnet34.onnx" "$wespeaker_assets/"
+curl --fail --location --output "$wespeaker_assets/infer_onnx.py" \
+    https://raw.githubusercontent.com/wenet-e2e/wespeaker/fb2325c1769958ccf979667862193419c9fc0551/wespeaker/bin/infer_onnx.py
+RTSS_TEST_WESPEAKER=1 RTSS_WESPEAKER_TEST_ASSETS="$wespeaker_assets" \
+    python -m pytest tests/test_evaluation_speaker.py -m metric_backend
+```
+
+**Checks**
+
+Ruff lint and formatting, `git diff --check`, and pytest passed in the `audio`
+environment on Python 3.12.13 (246 passed, five opt-in tests skipped by default).
+The opt-in test matched the official extractor's 256-dimensional output within `1e-5` absolute
+and relative tolerances for spans of 48,000 and 64,321 samples. It used identical
+decoded samples with PyTorch 2.13.0, TorchAudio 2.11.0, and CPU ONNX Runtime
+1.20.1 and 1.32.0. The test supplies WAV decoding through SoundFile so the
+official frontend can run with no TorchCodec dependency.
+
+On temporary copies of two public speech triples, the CPU CLI reported one
+scored target utterance and one short, ineligible utterance. It wrote both
+JSON and CSV reports and reused both results on rerun. An invalid ONNX file
+failed preflight with a nonzero exit status before writing any reports.
+
+After review, pytest passed with 248 tests and five opt-in skips. The opt-in
+WeSpeaker parity check passed separately. The CPU CLI populated an empty
+temporary cache from ModelScope and reused the verified asset and both results
+on rerun with HTTPS routed to an unreachable local proxy.
+
+After correcting the eligibility rule, the CLI test verifies that 48,000
+active samples qualify and that 47,999 active samples in a 48,000-sample span
+are ineligible. The full suite still passes. A CPU CLI rerun recomputed both
+results produced under the previous span rule and wrote a new report.
 
 ### Stage 9 — Add transcription and WER
 
